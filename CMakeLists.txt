@@ -46,16 +46,16 @@ target_include_directories(lua_static PUBLIC ${LUA_SRC_DIR})
 # lua.c (the interactive REPL) is excluded from the build so LUA_USE_READLINE
 # never pulls in libreadline on any platform.
 if(MSVC)
-    target_compile_options(lua_static PRIVATE /O2 /W3)
-    target_compile_definitions(lua_static PRIVATE _CRT_SECURE_NO_WARNINGS)
+  target_compile_options(lua_static PRIVATE /O2 /W3)
+  target_compile_definitions(lua_static PRIVATE _CRT_SECURE_NO_WARNINGS)
 elseif(APPLE)
-    target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra -Werror)
-    target_compile_definitions(lua_static PRIVATE LUA_USE_MACOSX)
-    target_link_libraries(lua_static PUBLIC m)
+  target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra -Werror)
+  target_compile_definitions(lua_static PRIVATE LUA_USE_MACOSX)
+  target_link_libraries(lua_static PUBLIC m)
 else() # Linux
-    target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra -Werror)
-    target_compile_definitions(lua_static PRIVATE LUA_USE_LINUX)
-    target_link_libraries(lua_static PUBLIC m dl)
+  target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra -Werror)
+  target_compile_definitions(lua_static PRIVATE LUA_USE_LINUX)
+  target_link_libraries(lua_static PUBLIC m dl)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -64,9 +64,9 @@ endif()
 add_executable(main src/main.cpp)
 target_link_libraries(main PRIVATE lua_static)
 if(MSVC)
-    target_compile_options(main PRIVATE /O2 /W4 /WX)
+  target_compile_options(main PRIVATE /O2 /W4 /WX)
 else()
-    target_compile_options(main PRIVATE -O2 -Wall -Wextra -Werror)
+  target_compile_options(main PRIVATE -O2 -Wall -Wextra -Werror)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -78,16 +78,18 @@ FetchContent_Declare(
     GIT_TAG v3.15.2
 )
 FetchContent_MakeAvailable(Catch2)
+list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
+include(Catch)
 
 add_executable(tests src/test.cpp)
 target_link_libraries(tests PRIVATE lua_static Catch2::Catch2WithMain)
 if(MSVC)
-    target_compile_options(tests PRIVATE /O2 /W4 /WX)
+  target_compile_options(tests PRIVATE /O2 /W4 /WX)
 else()
-    target_compile_options(tests PRIVATE -O2 -Wall -Wextra -Werror)
+  target_compile_options(tests PRIVATE -O2 -Wall -Wextra -Werror)
 endif()
 
 enable_testing()
-add_test(NAME LuaCppTests COMMAND $<TARGET_FILE:tests>)
+catch_discover_tests(tests)
 
 
