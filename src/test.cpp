@@ -401,8 +401,8 @@ TEST_CASE("expose_func: multiple return values", "[expose_func]")
 TEST_CASE("expose_func: captures value from registration site", "[expose_func]")
 {
 	Lua lua;
-	const int offset = 100;
-	lua.expose_func<int>("add_offset", std::function<int(int)>([](int x) { return x + offset; }));
+	constexpr int offset = 100;
+	lua.expose_func<int>("add_offset", std::function<int(int)>([=](int x) { return x + offset; }));
 
 	auto [ok, err, result] = lua.call<int>("add_offset", 5);
 	REQUIRE(ok);
