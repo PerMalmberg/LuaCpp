@@ -7,6 +7,7 @@ extern "C" {
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -48,10 +49,16 @@ public:
       return {false, get_error_message(), ReturnTypes{}...};
     }
 
-    auto ret = collect<ReturnTypes...>(
-        std::make_index_sequence<sizeof...(ReturnTypes)>{});
-    lua_pop(*this, ret_count);
-    return std::tuple_cat(std::make_tuple(true, std::string{}), std::move(ret));
+    try {
+      auto ret = collect<ReturnTypes...>(
+          std::make_index_sequence<sizeof...(ReturnTypes)>{});
+      lua_pop(*this, ret_count);
+      return std::tuple_cat(std::make_tuple(true, std::string{}),
+                            std::move(ret));
+    } catch (const std::runtime_error &e) {
+      lua_pop(*this, ret_count);
+      return {false, e.what(), ReturnTypes{}...};
+    }
   }
 
 private:
@@ -74,14 +81,26 @@ private:
   LuaStatePtr state{luaL_newstate(), [](lua_State *L) { lua_close(L); }};
 
   template <typename T> T read(int index) const {
+    const auto actual =
+        std::string(lua_typename(*this, lua_type(*this, index)));
     if constexpr (std::is_integral_v<T>) {
+      if (!lua_isinteger(*this, index))
+        throw std::runtime_error("expected integer, got " + actual);
       return static_cast<T>(lua_tointeger(*this, index));
     } else if constexpr (std::is_floating_point_v<T>) {
+      if (!lua_isnumber(*this, index))
+        throw std::runtime_error("expected number, got " + actual);
       return static_cast<T>(lua_tonumber(*this, index));
     } else if constexpr (std::is_same_v<T, std::string>) {
+      if (!lua_isstring(*this, index))
+        throw std::runtime_error("expected string, got " + actual);
       return {lua_tostring(*this, index)};
     } else if constexpr (std::is_same_v<T, const char *>) {
-      return lua_tostring(*this, index);
+      static_assert(!std::is_same_v<T, T>,
+                    "read: const char* is unsafe as a return type — "
+                    "lua_tostring returns a pointer into Lua-managed memory "
+                    "that becomes invalid after the value is popped from the "
+                    "stack. Use std::string instead.");
     } else {
       static_assert(!std::is_same_v<T, T>, "read: unsupported type");
     }
@@ -110,7 +129,7 @@ private:
       // const char*
       lua_pushstring(*this, value);
     } else {
-      static_assert(!std::is_same_v<T, T>, "push_value: unsupported type");
+      static_assert(!std::is_same_v<T, T>, "push: unsupported type");
     }
   }
 };

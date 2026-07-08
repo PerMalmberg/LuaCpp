@@ -42,7 +42,7 @@ add_library(lua_static STATIC ${LUA_SOURCES})
 
 target_include_directories(lua_static PUBLIC ${LUA_SRC_DIR})
 
-target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra)
+target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra -Werror)
 
 # Linux requires LUA_USE_LINUX and links against libdl
 target_compile_definitions(lua_static PRIVATE LUA_USE_LINUX)
@@ -53,4 +53,5 @@ target_link_libraries(lua_static PUBLIC m dl)
 # ---------------------------------------------------------------------------
 add_executable(main src/main.cpp)
 target_link_libraries(main PRIVATE lua_static)
+target_compile_options(main PRIVATE -O2 -Wall -Wextra -Werror)
 
