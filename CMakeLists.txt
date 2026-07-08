@@ -42,18 +42,32 @@ add_library(lua_static STATIC ${LUA_SOURCES})
 
 target_include_directories(lua_static PUBLIC ${LUA_SRC_DIR})
 
-target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra -Werror)
-
-# Linux requires LUA_USE_LINUX and links against libdl
-target_compile_definitions(lua_static PRIVATE LUA_USE_LINUX)
-target_link_libraries(lua_static PUBLIC m dl)
+# Platform-specific Lua defines and system libraries.
+# lua.c (the interactive REPL) is excluded from the build so LUA_USE_READLINE
+# never pulls in libreadline on any platform.
+if(MSVC)
+    target_compile_options(lua_static PRIVATE /O2 /W3)
+    target_compile_definitions(lua_static PRIVATE _CRT_SECURE_NO_WARNINGS)
+elseif(APPLE)
+    target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra -Werror)
+    target_compile_definitions(lua_static PRIVATE LUA_USE_MACOSX)
+    target_link_libraries(lua_static PUBLIC m)
+else() # Linux
+    target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra -Werror)
+    target_compile_definitions(lua_static PRIVATE LUA_USE_LINUX)
+    target_link_libraries(lua_static PUBLIC m dl)
+endif()
 
 # ---------------------------------------------------------------------------
 # Sample host executable
 # ---------------------------------------------------------------------------
 add_executable(main src/main.cpp)
 target_link_libraries(main PRIVATE lua_static)
-target_compile_options(main PRIVATE -O2 -Wall -Wextra -Werror)
+if(MSVC)
+    target_compile_options(main PRIVATE /O2 /W4 /WX)
+else()
+    target_compile_options(main PRIVATE -O2 -Wall -Wextra -Werror)
+endif()
 
 # ---------------------------------------------------------------------------
 # Catch2 and tests
@@ -67,6 +81,13 @@ FetchContent_MakeAvailable(Catch2)
 
 add_executable(tests src/test.cpp)
 target_link_libraries(tests PRIVATE lua_static Catch2::Catch2WithMain)
-target_compile_options(tests PRIVATE -O2 -Wall -Wextra -Werror)
+if(MSVC)
+    target_compile_options(tests PRIVATE /O2 /W4 /WX)
+else()
+    target_compile_options(tests PRIVATE -O2 -Wall -Wextra -Werror)
+endif()
+
+enable_testing()
+add_test(NAME LuaCppTests COMMAND $<TARGET_FILE:tests>)
 
 
