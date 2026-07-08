@@ -55,3 +55,18 @@ add_executable(main src/main.cpp)
 target_link_libraries(main PRIVATE lua_static)
 target_compile_options(main PRIVATE -O2 -Wall -Wextra -Werror)
 
+# ---------------------------------------------------------------------------
+# Catch2 and tests
+# ---------------------------------------------------------------------------
+FetchContent_Declare(
+    Catch2
+    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+    GIT_TAG v3.15.2
+)
+FetchContent_MakeAvailable(Catch2)
+
+add_executable(tests src/test.cpp)
+target_link_libraries(tests PRIVATE lua_static Catch2::Catch2WithMain)
+target_compile_options(tests PRIVATE -O2 -Wall -Wextra -Werror)
+
+
