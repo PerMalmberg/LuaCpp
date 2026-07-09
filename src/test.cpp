@@ -1680,7 +1680,7 @@ TEST_CASE("expose_method: map<string,int> return", "[expose_method][map]")
 	REQUIRE(result.at("y") == 8);
 }
 
-TEST_CASE("expose_method: Bag::sum — method on struct with vector field", "[expose_method][struct][vector]")
+TEST_CASE("expose_method: Bag::sum - method on struct with vector field", "[expose_method][struct][vector]")
 {
 	Lua lua;
 	lua.expose_method<Bag, int>("sum", std::function<int(Bag)>(
@@ -1696,7 +1696,7 @@ TEST_CASE("expose_method: Bag::sum — method on struct with vector field", "[ex
 	REQUIRE(ok);
 }
 
-TEST_CASE("expose_method: Registry::lookup — method with map field and string arg", "[expose_method][struct][map]")
+TEST_CASE("expose_method: Registry::lookup - method with map field and string arg", "[expose_method][struct][map]")
 {
 	Lua lua;
 	lua.expose_method<Registry, int>("lookup", std::function<int(Registry, std::string)>(
@@ -1736,7 +1736,7 @@ TEST_CASE("expose_mutable_method: Bag::clear empties vector field in place", "[e
 	REQUIRE(ok);
 }
 
-TEST_CASE("expose_mutable_method: Bag::pop — scalar return plus vector mutation",
+TEST_CASE("expose_mutable_method: Bag::pop - scalar return plus vector mutation",
           "[expose_mutable_method][struct][vector]")
 {
 	Lua lua;
@@ -1806,7 +1806,7 @@ LUA_REGISTER_STRUCT(Config,
                     lua_field("settings", &Config::settings))
 
 // ------------------------------------------------------------
-// 1. Pure table literal — no factory, no exposed methods.
+// 1. Pure table literal - no factory, no exposed methods.
 //    Lua constructs the entire instance from Lua-side literals.
 // ------------------------------------------------------------
 TEST_CASE("Lua constructs Config from pure table literal", "[construction][struct]")
@@ -1881,7 +1881,7 @@ TEST_CASE("Lua constructs Config via factory and mutable builder",
 // ------------------------------------------------------------
 // 3. Factory-built collection.
 //    Lua calls the factory in a loop and returns a
-//    vector<Config> — each element fully created in Lua.
+//    vector<Config> - each element fully created in Lua.
 // ------------------------------------------------------------
 TEST_CASE("Lua builds vector<Config> via factory", "[construction][expose_func][struct][vector]")
 {
