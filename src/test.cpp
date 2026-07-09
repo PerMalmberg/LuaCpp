@@ -500,3 +500,131 @@ TEST_CASE("expose_func stack hygiene: succeeds after an error", "[expose_func][s
 	REQUIRE(ok2);
 	REQUIRE(result == 30);
 }
+
+// ============================================================
+// Struct support
+// ============================================================
+
+struct Point
+{
+	int x, y;
+};
+LUA_REGISTER_STRUCT(Point, lua_field("x", &Point::x), lua_field("y", &Point::y))
+
+struct Rect
+{
+	Point origin;
+	int w, h;
+};
+LUA_REGISTER_STRUCT(Rect, lua_field("origin", &Rect::origin), lua_field("w", &Rect::w), lua_field("h", &Rect::h))
+
+TEST_CASE("struct: passed as argument to Lua function", "[struct]")
+{
+	Lua lua;
+	lua.run_script("function sum(p) return p.x + p.y end");
+	auto [ok, err, result] = lua.call<int>("sum", Point{3, 4});
+	REQUIRE(ok);
+	REQUIRE(result == 7);
+}
+
+TEST_CASE("struct: returned from Lua via call<>", "[struct]")
+{
+	Lua lua;
+	lua.run_script("function make(x, y) return {x = x, y = y} end");
+	auto [ok, err, p] = lua.call<Point>("make", 10, 20);
+	REQUIRE(ok);
+	REQUIRE(p.x == 10);
+	REQUIRE(p.y == 20);
+}
+
+TEST_CASE("struct: round-trip through Lua", "[struct]")
+{
+	Lua lua;
+	lua.run_script("function move(p, dx, dy) return {x = p.x + dx, y = p.y + dy} end");
+	auto [ok, err, result] = lua.call<Point>("move", Point{1, 2}, 10, 20);
+	REQUIRE(ok);
+	REQUIRE(result.x == 11);
+	REQUIRE(result.y == 22);
+}
+
+TEST_CASE("struct: as expose_func argument", "[struct]")
+{
+	Lua lua;
+	lua.expose_func<int>("magnitude_sq", std::function<int(Point)>([](Point p) { return p.x * p.x + p.y * p.y; }));
+	auto [ok, err] = lua.run_script("assert(magnitude_sq({x=3, y=4}) == 25)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("struct: as expose_func return type", "[struct]")
+{
+	Lua lua;
+	lua.expose_func<Point>("make_point", std::function<Point(int, int)>([](int x, int y) { return Point{x, y}; }));
+	auto [ok, err, p] = lua.call<Point>("make_point", 5, 6);
+	REQUIRE(ok);
+	REQUIRE(p.x == 5);
+	REQUIRE(p.y == 6);
+}
+
+TEST_CASE("struct: nested struct round-trip", "[struct]")
+{
+	Lua lua;
+	lua.run_script(R"(
+		function scale(r, f)
+			return {origin = {x = r.origin.x * f, y = r.origin.y * f}, w = r.w * f, h = r.h * f}
+		end
+	)");
+	Rect r{Point{1, 2}, 3, 4};
+	auto [ok, err, result] = lua.call<Rect>("scale", r, 2);
+	REQUIRE(ok);
+	REQUIRE(result.origin.x == 2);
+	REQUIRE(result.origin.y == 4);
+	REQUIRE(result.w == 6);
+	REQUIRE(result.h == 8);
+}
+
+TEST_CASE("struct: two distinct instances have independent values in Lua", "[struct]")
+{
+	Lua lua;
+	lua.run_script(R"(
+		function check(a, b)
+			return a.x + a.y, b.x + b.y
+		end
+	)");
+	auto [ok, err, sum_a, sum_b] = lua.call<int, int>("check", Point{1, 2}, Point{10, 20});
+	REQUIRE(ok);
+	REQUIRE(sum_a == 3); // 1 + 2
+	REQUIRE(sum_b == 30); // 10 + 20
+}
+
+// ============================================================
+// Struct - error cases
+// ============================================================
+
+TEST_CASE("struct error: non-table returned where struct expected", "[struct]")
+{
+	Lua lua;
+	lua.run_script("function f() return 42 end");
+	auto [ok, err, p] = lua.call<Point>("f");
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected table"));
+}
+
+TEST_CASE("struct error: wrong field type in table", "[struct]")
+{
+	Lua lua;
+	lua.run_script("function f() return {x = 'oops', y = 2} end");
+	auto [ok, err, p] = lua.call<Point>("f");
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected integer"));
+}
+
+TEST_CASE("struct error: missing field reads as nil", "[struct]")
+{
+	// lua_getfield returns nil for a missing key; read<int> then throws
+	Lua lua;
+	lua.run_script("function f() return {x = 1} end"); // y is missing
+	auto [ok, err, p] = lua.call<Point>("f");
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected integer"));
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("nil"));
+}

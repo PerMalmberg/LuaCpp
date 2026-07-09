@@ -14,10 +14,10 @@ extern "C"
 #include <vector>
 
 // Determines the C++ return type for a expose_func registration based on the number
-// of declared Lua return values – mirrors the convention used by call<>:
-//   0 types  →  void
-//   1 type   →  T          (not wrapped in a tuple)
-//   N types  →  std::tuple<Ts...>
+// of declared Lua return values - mirrors the convention used by call<>:
+//   0 types  -> void
+//   1 type   -> T          (not wrapped in a tuple)
+//   N types  -> std::tuple<Ts...>
 template <typename... Ts>
 struct lua_return_type
 {
@@ -35,6 +35,56 @@ struct lua_return_type<>
 };
 template <typename... Ts>
 using lua_return_t = typename lua_return_type<Ts...>::type;
+
+// ---------------------------------------------------------------------------
+// Struct <-> Lua-table binding
+//
+// Describe a single named member:  lua_field("x", &Point::x)
+// Register all fields at namespace scope after the struct definition:
+//
+//   LUA_REGISTER_STRUCT(Point,
+//       lua_field("x", &Point::x),
+//       lua_field("y", &Point::y))
+//
+// The type can then be used as an argument or return type in call<>()
+// and expose_func<>(); it maps to/from a Lua table.
+// Nesting is supported: a field whose type is itself registered works
+// automatically.
+// ---------------------------------------------------------------------------
+
+template <typename Struct, typename Member>
+struct LuaField
+{
+	const char* name;
+	Member Struct::* ptr;
+};
+
+template <typename Struct, typename Member>
+constexpr LuaField<Struct, Member> lua_field(const char* name, Member Struct::* ptr)
+{
+	return {name, ptr};
+}
+
+// Specialise this for every struct you want to exchange with Lua.
+template <typename T>
+struct LuaFields; // intentionally undefined - gives a clear error for unregistered types
+
+// True when LuaFields<T> has been specialised.
+template <typename T, typename = void>
+struct has_lua_fields : std::false_type
+{
+};
+template <typename T>
+struct has_lua_fields<T, std::void_t<decltype(LuaFields<T>::value)>> : std::true_type
+{
+};
+
+#define LUA_REGISTER_STRUCT(Type, ...)                                                                                 \
+	template <>                                                                                                        \
+	struct LuaFields<Type>                                                                                             \
+	{                                                                                                                  \
+		static constexpr auto value = std::make_tuple(__VA_ARGS__);                                                    \
+	};
 
 class Lua
 {
@@ -74,8 +124,7 @@ class Lua
 			return {false, "Not a function: " + std::string(func), ReturnTypes{}...};
 		}
 
-		(push(state.get(), args),
-		 ...); // C++17 fold expression to push all arguments onto the Lua stack
+		(push(state.get(), args), ...); // C++17 fold expression to push all arguments onto the Lua stack
 
 		const auto arg_count = static_cast<int>(sizeof...(Args));
 		const auto ret_count = static_cast<int>(sizeof...(ReturnTypes));
@@ -100,24 +149,24 @@ class Lua
 
 	// Registers a C++ callable as a named Lua global.
 	//
-	// ReturnTypes – what the function returns to Lua, using the same convention
+	// ReturnTypes - what the function returns to Lua, using the same convention
 	//               as call<>: omit for void, one type for a scalar return,
 	//               multiple types when the function returns std::tuple<Ts...>.
-	// Args        – deduced from the std::function signature.
+	// Args        - deduced from the std::function signature.
 	//
 	// Type mismatches in arguments or return values, and wrong argument counts,
 	// are reported as Lua errors (visible to the caller via pcall / call<>).
 	//
-	// Example – scalar return:
+	// Example - scalar return:
 	//   lua.expose_func<int>("add",
 	//       std::function<int(int, int)>([](int a, int b){ return a + b; }));
 	//
-	// Example – multiple returns:
+	// Example - multiple returns:
 	//   lua.expose_func<int, std::string>("pair",
 	//       std::function<std::tuple<int,std::string>(int)>(
 	//           [](int n){ return std::make_tuple(n, std::to_string(n)); }));
 	//
-	// Example – void return:
+	// Example - void return:
 	//   lua.expose_func("log",
 	//       std::function<void(std::string)>(
 	//           [](std::string msg){ std::cout << msg << '\n'; }));
@@ -222,7 +271,7 @@ class Lua
 	std::vector<std::unique_ptr<LuaFunc>> registered_funcs_;
 
 	// ---------------------------------------------------------------------------
-	// Stack I/O – static so they work both from instance methods and from inside
+	// Stack I/O - static so they work both from instance methods and from inside
 	// expose_func closures that only have a bare lua_State *.
 	// ---------------------------------------------------------------------------
 
@@ -255,6 +304,17 @@ class Lua
 			                                     "that becomes invalid after the value is popped from the "
 			                                     "stack. Use std::string instead.");
 		}
+		else if constexpr(has_lua_fields<T>::value)
+		{
+			if(!lua_istable(L, index))
+			{
+				throw std::runtime_error("expected table, got " + actual);
+			}
+			T result{};
+			std::apply([&](const auto&... fields) { (read_struct_field(L, index, result, fields), ...); },
+			           LuaFields<T>::value);
+			return result;
+		}
 		else
 		{
 			static_assert(!std::is_same_v<T, T>, "read: unsupported type");
@@ -279,6 +339,11 @@ class Lua
 		else if constexpr(std::is_same_v<T, const char*>)
 		{
 			lua_pushstring(L, value);
+		}
+		else if constexpr(has_lua_fields<T>::value)
+		{
+			lua_newtable(L);
+			std::apply([&](const auto&... fields) { (push_struct_field(L, value, fields), ...); }, LuaFields<T>::value);
 		}
 		else
 		{
@@ -311,5 +376,22 @@ class Lua
 		// Stack layout after lua_pcall (N=3): [-3]=first, [-2]=second, [-1]=last
 		// index_sequence {0,1,2} maps to stack indices {0-3, 1-3, 2-3} = {-3,-2,-1}
 		return {read<ReturnTypes>(state.get(), static_cast<int>(Is) - N)...};
+	}
+
+	// Pushes one field of a registered struct as a named Lua table entry.
+	template <typename Struct, typename Member>
+	static void push_struct_field(lua_State* L, const Struct& s, const LuaField<Struct, Member>& f)
+	{
+		push(L, s.*f.ptr);
+		lua_setfield(L, -2, f.name); // table is at -2 after the field value was pushed
+	}
+
+	// Reads one named table entry into a field of a registered struct.
+	template <typename Struct, typename Member>
+	static void read_struct_field(lua_State* L, int idx, Struct& s, const LuaField<Struct, Member>& f)
+	{
+		lua_getfield(L, idx, f.name); // pushes field value; idx still refers to the table
+		s.*f.ptr = read<Member>(L, -1);
+		lua_pop(L, 1);
 	}
 };
