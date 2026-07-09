@@ -296,11 +296,12 @@ class Lua
 		return state.get();
 	}
 
-	LuaStatePtr state{luaL_newstate(), [](lua_State* L) { lua_close(L); }};
-
 	// Owns the typed wrapper objects whose raw pointers are stored as Lua
-	// upvalues. Must outlive the lua_State.
+	// upvalues. Declared before state so it is destroyed after lua_close(),
+	// ensuring no dangling LuaFunc* pointers exist while the state is live.
 	std::vector<std::unique_ptr<LuaFunc>> registered_funcs_;
+
+	LuaStatePtr state{luaL_newstate(), [](lua_State* L) { lua_close(L); }};
 
 	// ---------------------------------------------------------------------------
 	// Stack I/O - static so they work both from instance methods and from inside
