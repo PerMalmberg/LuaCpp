@@ -20,8 +20,8 @@ and from Lua scripts with automatic type checking and clear error messages.
   - [run\_script](#run_script)
   - [assign](#assign)
   - [call](#call)
-  - [expose\_func](#expose_func)
   - [Struct Binding](#struct-binding)
+  - [expose\_func](#expose_func)
   - [expose\_method](#expose_method)
   - [expose\_mutable\_method](#expose_mutable_method)
 - [Gotchas](#gotchas)
@@ -158,44 +158,6 @@ discards the extras.
 
 ---
 
-### expose_func
-
-```cpp
-lua.expose_func<ReturnTypes...>("name", std::function<sig>([](args){ ... }));
-```
-
-Registers a C++ callable as a named Lua global. The callable **must** be wrapped
-in `std::function`. Type mismatches and wrong argument counts are reported as Lua
-errors.
-
-```cpp
-// Void return
-lua.expose_func("log",
-    std::function<void(std::string)>([](std::string msg) {
-        std::cout << msg << '\n';
-    }));
-
-// Scalar return
-lua.expose_func<double>("lerp",
-    std::function<double(double, double, double)>([](double a, double b, double t) {
-        return a + (b - a) * t;
-    }));
-
-// Multiple returns
-lua.expose_func<int, int>("divmod",
-    std::function<std::tuple<int,int>(int, int)>([](int a, int b) {
-        return std::make_tuple(a / b, a % b);
-    }));
-
-// Struct arg and return
-lua.expose_func<Point>("midpoint",
-    std::function<Point(Point, Point)>([](Point a, Point b) {
-        return Point{(a.x + b.x) / 2, (a.y + b.y) / 2};
-    }));
-```
-
----
-
 ### Struct Binding
 
 Use `LUA_REGISTER_STRUCT` **at namespace scope** (not inside a function or class)
@@ -253,6 +215,44 @@ auto [ok, err, p] = lua.call<Point>("make");
 lua.expose_func<Point>("point",
     std::function<Point(int, int)>([](int x, int y) { return Point{x, y}; }));
 lua.run_script("local p = point(3, 4)");
+```
+
+---
+
+### expose_func
+
+```cpp
+lua.expose_func<ReturnTypes...>("name", std::function<sig>([](args){ ... }));
+```
+
+Registers a C++ callable as a named Lua global. The callable **must** be wrapped
+in `std::function`. Type mismatches and wrong argument counts are reported as Lua
+errors.
+
+```cpp
+// Void return
+lua.expose_func("log",
+    std::function<void(std::string)>([](std::string msg) {
+        std::cout << msg << '\n';
+    }));
+
+// Scalar return
+lua.expose_func<double>("lerp",
+    std::function<double(double, double, double)>([](double a, double b, double t) {
+        return a + (b - a) * t;
+    }));
+
+// Multiple returns
+lua.expose_func<int, int>("divmod",
+    std::function<std::tuple<int,int>(int, int)>([](int a, int b) {
+        return std::make_tuple(a / b, a % b);
+    }));
+
+// Struct arg and return
+lua.expose_func<Point>("midpoint",
+    std::function<Point(Point, Point)>([](Point a, Point b) {
+        return Point{(a.x + b.x) / 2, (a.y + b.y) / 2};
+    }));
 ```
 
 ---
