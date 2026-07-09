@@ -52,6 +52,16 @@ using lua_return_t = typename lua_return_type<Ts...>::type;
 // and expose_func<>(); it maps to/from a Lua table.
 // Nesting is supported: a field whose type is itself registered works
 // automatically.
+//
+// Constraints:
+//   - Must be placed at namespace scope, not inside a function or class body.
+//   - The struct must be default-constructible; read<T> zero-initialises a
+//     T result{} before filling registered fields one by one.
+//   - Only fields listed in the macro are exchanged with Lua. Extra Lua table
+//     keys are silently ignored on read. Fields absent from the Lua table are
+//     read as nil, which causes a type error for most C++ member types.
+//   - Structs are always exchanged by value; each push or read copies the
+//     entire struct, including any container-typed fields.
 // ---------------------------------------------------------------------------
 
 template <typename Struct, typename Member>
@@ -139,6 +149,17 @@ class Lua
 		return {true, {}};
 	}
 
+	// Assigns a C++ value to a named Lua global, replacing any previous value.
+	//
+	// bool: pushed as a Lua integer (1 = true, 0 = false), NOT as a Lua boolean.
+	//   Lua code must compare with == 1 / == 0, not == true / == false.
+	//
+	// const char*: the string is copied by Lua immediately; the pointer does not
+	//   need to remain valid after assign() returns.
+	//
+	// Structs and containers: copied in full by value into a new Lua table.
+	//   Subsequent Lua-side mutations to the table do not affect the original
+	//   C++ object.
 	template <typename T>
 	void assign(const char* name, const T value)
 	{
@@ -146,6 +167,20 @@ class Lua
 		lua_setglobal(*this, name);
 	}
 
+	// Calls a named Lua global function and collects up to N typed return values.
+	//
+	// ReturnTypes must appear in the same left-to-right order as the Lua
+	// function's return values. Specifying fewer types than the function returns
+	// is safe; Lua discards the extras. Specifying MORE types causes missing
+	// stack slots to be nil, which fails read<T> and returns
+	// {false, "expected ..., got nil", ...}.
+	//
+	// bool ReturnType: only succeeds when Lua returns an integer (1 or 0).
+	//   Native Lua booleans (true / false) fail lua_isinteger and produce a
+	//   type error. Use int, or convert in Lua: return b and 1 or 0.
+	//
+	// On any failure the first tuple element is false and the second is the
+	// error message; all ReturnType slots hold their zero-initialised defaults.
 	template <typename... ReturnTypes, typename... Args>
 	std::tuple<bool, std::string, ReturnTypes...> call(const char* func, Args... args)
 	{
@@ -202,6 +237,17 @@ class Lua
 	//   lua.expose_func("log",
 	//       std::function<void(std::string)>(
 	//           [](std::string msg){ std::cout << msg << '\n'; }));
+	//
+	// Pitfalls:
+	//   - The callable must be wrapped in std::function; a raw lambda or
+	//     function pointer is not accepted because Args... cannot be deduced.
+	//   - const char* cannot be used as an Arg type: read<const char*> is
+	//     disabled via static_assert to prevent dangling pointers into Lua
+	//     memory. Use std::string instead.
+	//   - Lambda captures that hold references must outlive the Lua instance.
+	//     Value captures are always safe.
+	//   - Registering a name that already exists as a Lua global silently
+	//     replaces it; no warning is produced.
 	template <typename... ReturnTypes, typename... Args>
 	void expose_func(const char* name, std::function<lua_return_t<ReturnTypes...>(Args...)> func)
 	{
@@ -267,6 +313,15 @@ class Lua
 	//   lua.expose_method<Point, Point>("translate",
 	//       std::function<Point(Point, int, int)>(
 	//           [](Point p, int dx, int dy){ return Point{p.x+dx, p.y+dy}; }));
+	//
+	// Pitfalls:
+	//   - Methods must be registered BEFORE any instance of StructType is pushed
+	//     to Lua (via assign, call<>, or an expose_func return value). Tables
+	//     already in Lua do not retroactively gain the metatable.
+	//   - self is read from the Lua table by value on every call. Mutations
+	//     inside the C++ function are NOT written back to Lua. Use
+	//     expose_mutable_method when the struct must be updated in place.
+	//   - const char* cannot be used as an Arg or ReturnType (see expose_func).
 	template <typename StructType, typename... ReturnTypes, typename... Args>
 	void expose_method(const char* name, std::function<lua_return_t<ReturnTypes...>(StructType, Args...)> func)
 	{
@@ -333,6 +388,18 @@ class Lua
 	//   lua.expose_mutable_method<Point, int>("scale_and_sum",
 	//       std::function<int(Point&, int)>(
 	//           [](Point& p, int f){ p.x *= f; p.y *= f; return p.x + p.y; }));
+	//
+	// Pitfalls:
+	//   - Same registration-timing rule as expose_method: register before
+	//     pushing instances to Lua.
+	//   - Write-back covers only fields declared in LUA_REGISTER_STRUCT for
+	//     StructType. Extra keys added to the Lua table by Lua code are
+	//     preserved but not managed.
+	//   - self follows a copy-mutate-write-back cycle: copied from the Lua
+	//     table into a C++ value, mutated by the function, then all registered
+	//     fields are written back. There is no shared pointer into Lua memory;
+	//     all exchanged fields must be copyable value types (or supported
+	//     containers / registered structs thereof).
 	template <typename StructType, typename... ReturnTypes, typename... Args>
 	void expose_mutable_method(const char* name, std::function<lua_return_t<ReturnTypes...>(StructType&, Args...)> func)
 	{
@@ -421,25 +488,34 @@ class Lua
 		const auto actual = std::string(lua_typename(L, lua_type(L, index)));
 		if constexpr(std::is_integral_v<T>)
 		{
+			// lua_isinteger returns false for:
+			//   - Native Lua booleans (true/false). To read a real boolean use int
+			//     and test 0/1, or convert in Lua: return b and 1 or 0.
+			//   - Lua floats, even whole-number ones such as 1.0. Use a
+			//     floating-point ReturnType if the Lua expression may yield a float.
 			if(!lua_isinteger(L, index))
 				throw std::runtime_error("expected integer, got " + actual);
 			return static_cast<T>(lua_tointeger(L, index));
 		}
 		else if constexpr(std::is_floating_point_v<T>)
 		{
+			// lua_isnumber returns true for Lua integers as well as floats, so
+			// integer values are silently widened to the C++ floating-point type.
 			if(!lua_isnumber(L, index))
 				throw std::runtime_error("expected number, got " + actual);
 			return static_cast<T>(lua_tonumber(L, index));
 		}
 		else if constexpr(std::is_same_v<T, std::string>)
 		{
+			// lua_isstring returns true for Lua numbers (implicit coercion), so a
+			// Lua integer or float value can be read back as std::string.
 			if(!lua_isstring(L, index))
 				throw std::runtime_error("expected string, got " + actual);
 			return {lua_tostring(L, index)};
 		}
 		else if constexpr(std::is_same_v<T, const char*>)
 		{
-			static_assert(!std::is_same_v<T, T>, "read: const char* is unsafe as a return type — "
+			static_assert(!std::is_same_v<T, T>, "read: const char* is unsafe as a return type - "
 			                                     "lua_tostring returns a pointer into Lua-managed memory "
 			                                     "that becomes invalid after the value is popped from the "
 			                                     "stack. Use std::string instead.");
@@ -450,6 +526,10 @@ class Lua
 			{
 				throw std::runtime_error("expected table, got " + actual);
 			}
+			// T result{} zero-initialises all fields before individual reads.
+			// If a registered field is absent from the Lua table, lua_getfield
+			// returns nil and read<Member> will throw a type error. All registered
+			// fields must be present and correctly typed in the Lua table.
 			T result{};
 			std::apply([&](const auto&... fields) { (read_struct_field(L, index, result, fields), ...); },
 			           LuaFields<T>::value);
@@ -508,6 +588,8 @@ class Lua
 	{
 		if constexpr(std::is_integral_v<T>)
 		{
+			// bool: pushed as a Lua integer (1 = true, 0 = false), not as a Lua
+			// boolean. Lua code must test with == 1 / == 0, not == true / == false.
 			lua_pushinteger(L, static_cast<lua_Integer>(value));
 		}
 		else if constexpr(std::is_floating_point_v<T>)
@@ -610,6 +692,8 @@ class Lua
 	// Writes all registered fields of s back into the Lua table at idx.
 	// Used by expose_mutable_method after calling the C++ handler so that any
 	// modifications made to self are reflected in the caller's Lua table.
+	// Only fields declared in LuaFields<T> are written; extra keys that Lua
+	// code may have added to the table are left untouched.
 	template <typename T>
 	static void write_struct_back(lua_State* L, int idx, const T& s)
 	{
@@ -707,7 +791,10 @@ class Lua
 
 	// Attaches T's method metatable (if any) to the table currently on top of the
 	// stack. Looks up the Lua registry; no-op when no methods have been registered
-	// for T.
+	// for T yet.
+	// Instances pushed before any expose_method / expose_mutable_method call for T
+	// will not have a metatable and cannot use colon-call syntax. Always register
+	// all methods before pushing instances of the type.
 	template <typename T>
 	static void attach_methods_if_any(lua_State* L)
 	{
