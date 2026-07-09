@@ -6,10 +6,12 @@ extern "C"
 }
 
 #include <functional>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -85,6 +87,36 @@ struct has_lua_fields<T, std::void_t<decltype(LuaFields<T>::value)>> : std::true
 	{                                                                                                                  \
 		static constexpr auto value = std::make_tuple(__VA_ARGS__);                                                    \
 	};
+
+// ---------------------------------------------------------------------------
+// Standard container traits
+// Used by push()/read() to detect std::vector and std::map/unordered_map.
+// T::value_type, T::key_type and T::mapped_type are used to recurse into
+// element types, so nested containers and containers of registered structs
+// work without any extra registration.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+struct is_std_vector : std::false_type
+{
+};
+template <typename T, typename A>
+struct is_std_vector<std::vector<T, A>> : std::true_type
+{
+};
+
+template <typename T>
+struct is_std_map : std::false_type
+{
+};
+template <typename K, typename V, typename C, typename A>
+struct is_std_map<std::map<K, V, C, A>> : std::true_type
+{
+};
+template <typename K, typename V, typename H, typename E, typename A>
+struct is_std_map<std::unordered_map<K, V, H, E, A>> : std::true_type
+{
+};
 
 class Lua
 {
@@ -315,6 +347,48 @@ class Lua
 			           LuaFields<T>::value);
 			return result;
 		}
+		else if constexpr(is_std_vector<T>::value)
+		{
+			if(!lua_istable(L, index))
+			{
+				throw std::runtime_error("expected table, got " + actual);
+			}
+
+			T result;
+			const lua_Integer len = static_cast<lua_Integer>(lua_rawlen(L, index));
+			result.reserve(static_cast<std::size_t>(len));
+			for(lua_Integer i = 1; i <= len; ++i)
+			{
+				lua_rawgeti(L, index, i);
+				result.push_back(read<typename T::value_type>(L, -1));
+				lua_pop(L, 1);
+			}
+			return result;
+		}
+		else if constexpr(is_std_map<T>::value)
+		{
+			if(!lua_istable(L, index))
+			{
+				throw std::runtime_error("expected table, got " + actual);
+			}
+
+			T result;
+			const int abs_idx = lua_absindex(L, index);
+			lua_pushnil(L); // first key for lua_next
+			while(lua_next(L, abs_idx) != 0)
+			{
+				// key at -2, value at -1
+				// push a copy of the key so lua_tostring cannot mutate the original
+				// during traversal (lua manual: do not call lua_tolstring on a key directly)
+				lua_pushvalue(L, -2);
+				auto key = read<typename T::key_type>(L, -1);
+				lua_pop(L, 1); // pop key copy
+				auto val = read<typename T::mapped_type>(L, -1);
+				lua_pop(L, 1); // pop value; leave original key for next iteration
+				result.emplace(std::move(key), std::move(val));
+			}
+			return result;
+		}
 		else
 		{
 			static_assert(!std::is_same_v<T, T>, "read: unsupported type");
@@ -344,6 +418,25 @@ class Lua
 		{
 			lua_newtable(L);
 			std::apply([&](const auto&... fields) { (push_struct_field(L, value, fields), ...); }, LuaFields<T>::value);
+		}
+		else if constexpr(is_std_vector<T>::value)
+		{
+			lua_newtable(L);
+			for(lua_Integer i = 0; i < static_cast<lua_Integer>(value.size()); ++i)
+			{
+				push(L, value[static_cast<std::size_t>(i)]);
+				lua_rawseti(L, -2, i + 1); // 1-indexed; table is at -2 after element push
+			}
+		}
+		else if constexpr(is_std_map<T>::value)
+		{
+			lua_newtable(L);
+			for(const auto& [k, v] : value)
+			{
+				push(L, k);
+				push(L, v);
+				lua_settable(L, -3); // table is at -3 after pushing key and value
+			}
 		}
 		else
 		{

@@ -628,3 +628,118 @@ TEST_CASE("struct error: missing field reads as nil", "[struct]")
 	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected integer"));
 	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("nil"));
 }
+
+// ============================================================
+// std::vector support
+// ============================================================
+
+TEST_CASE("vector: passed as argument to Lua function", "[vector]")
+{
+	Lua lua;
+	lua.run_script("function sum(t) local s = 0; for _, v in ipairs(t) do s = s + v end; return s end");
+	auto [ok, err, result] = lua.call<int>("sum", std::vector<int>{1, 2, 3, 4, 5});
+	REQUIRE(ok);
+	REQUIRE(result == 15);
+}
+
+TEST_CASE("vector: returned from Lua via call<>", "[vector]")
+{
+	Lua lua;
+	lua.run_script("function make() return {10, 20, 30} end");
+	auto [ok, err, result] = lua.call<std::vector<int>>("make");
+	REQUIRE(ok);
+	REQUIRE(result.size() == 3);
+	REQUIRE(result[0] == 10);
+	REQUIRE(result[1] == 20);
+	REQUIRE(result[2] == 30);
+}
+
+TEST_CASE("vector: round-trip preserves order and values", "[vector]")
+{
+	Lua lua;
+	lua.run_script("function identity(t) return t end");
+	std::vector<int> input{7, 3, 9, 1};
+	auto [ok, err, result] = lua.call<std::vector<int>>("identity", input);
+	REQUIRE(ok);
+	REQUIRE(result == input);
+}
+
+TEST_CASE("vector: of strings", "[vector]")
+{
+	Lua lua;
+	lua.run_script("function first(t) return t[1] end");
+	auto [ok, err, result] = lua.call<std::string>("first", std::vector<std::string>{"hello", "world"});
+	REQUIRE(ok);
+	REQUIRE(result == "hello");
+}
+
+TEST_CASE("vector: of registered structs", "[vector]")
+{
+	Lua lua;
+	lua.run_script("function sum_xs(t) local s = 0; for _, p in ipairs(t) do s = s + p.x end; return s end");
+	std::vector<Point> pts{{1, 0}, {2, 0}, {3, 0}};
+	auto [ok, err, result] = lua.call<int>("sum_xs", pts);
+	REQUIRE(ok);
+	REQUIRE(result == 6);
+}
+
+TEST_CASE("vector: empty round-trip", "[vector]")
+{
+	Lua lua;
+	lua.run_script("function identity(t) return t end");
+	auto [ok, err, result] = lua.call<std::vector<int>>("identity", std::vector<int>{});
+	REQUIRE(ok);
+	REQUIRE(result.empty());
+}
+
+TEST_CASE("vector error: non-table returned where vector expected", "[vector]")
+{
+	Lua lua;
+	lua.run_script("function f() return 42 end");
+	auto [ok, err, result] = lua.call<std::vector<int>>("f");
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected table"));
+}
+
+// ============================================================
+// std::map / std::unordered_map support
+// ============================================================
+
+TEST_CASE("map: passed as argument to Lua function", "[map]")
+{
+	Lua lua;
+	lua.run_script("function get(t, k) return t[k] end");
+	std::map<std::string, int> m{{"a", 1}, {"b", 2}};
+	auto [ok, err, result] = lua.call<int>("get", m, std::string("a"));
+	REQUIRE(ok);
+	REQUIRE(result == 1);
+}
+
+TEST_CASE("map: returned from Lua via call<>", "[map]")
+{
+	Lua lua;
+	lua.run_script("function make() return {x = 10, y = 20} end");
+	auto [ok, err, result] = lua.call<std::map<std::string, int>>("make");
+	REQUIRE(ok);
+	REQUIRE(result.at("x") == 10);
+	REQUIRE(result.at("y") == 20);
+}
+
+TEST_CASE("map: unordered_map round-trip", "[map]")
+{
+	Lua lua;
+	lua.run_script("function identity(t) return t end");
+	std::unordered_map<std::string, int> input{{"one", 1}, {"two", 2}, {"three", 3}};
+	auto [ok, err, result] = lua.call<std::unordered_map<std::string, int>>("identity", input);
+	REQUIRE(ok);
+	REQUIRE(result == input);
+}
+
+TEST_CASE("map error: non-table returned where map expected", "[map]")
+{
+	Lua lua;
+	lua.run_script("function f() return 'oops' end");
+	auto [ok, err, result] = lua.call<std::map<std::string, int>>("f");
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected table"));
+}
