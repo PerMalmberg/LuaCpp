@@ -151,8 +151,7 @@ class Lua
 
 	// Assigns a C++ value to a named Lua global, replacing any previous value.
 	//
-	// bool: pushed as a Lua integer (1 = true, 0 = false), NOT as a Lua boolean.
-	//   Lua code must compare with == 1 / == 0, not == true / == false.
+	// bool: pushed as a native Lua boolean; Lua code compares with == true / == false.
 	//
 	// const char*: the string is copied by Lua immediately; the pointer does not
 	//   need to remain valid after assign() returns.
@@ -175,9 +174,8 @@ class Lua
 	// stack slots to be nil, which fails read<T> and returns
 	// {false, "expected ..., got nil", ...}.
 	//
-	// bool ReturnType: only succeeds when Lua returns an integer (1 or 0).
-	//   Native Lua booleans (true / false) fail lua_isinteger and produce a
-	//   type error. Use int, or convert in Lua: return b and 1 or 0.
+	// bool ReturnType: expects a native Lua boolean. Integers (even 0 or 1)
+	//   fail the lua_isboolean check and produce a type error.
 	//
 	// On any failure the first tuple element is false and the second is the
 	// error message; all ReturnType slots hold their zero-initialised defaults.
@@ -486,13 +484,17 @@ class Lua
 	static T read(lua_State* L, int index)
 	{
 		const auto actual = std::string(lua_typename(L, lua_type(L, index)));
-		if constexpr(std::is_integral_v<T>)
+		if constexpr(std::is_same_v<T, bool>)
 		{
-			// lua_isinteger returns false for:
-			//   - Native Lua booleans (true/false). To read a real boolean use int
-			//     and test 0/1, or convert in Lua: return b and 1 or 0.
-			//   - Lua floats, even whole-number ones such as 1.0. Use a
-			//     floating-point ReturnType if the Lua expression may yield a float.
+			if(!lua_isboolean(L, index))
+				throw std::runtime_error("expected boolean, got " + actual);
+			return lua_toboolean(L, index) != 0;
+		}
+		else if constexpr(std::is_integral_v<T>)
+		{
+			// lua_isinteger returns false for Lua floats, even whole-number ones
+			// such as 1.0. Use a floating-point ReturnType if the Lua expression
+			// may yield a float.
 			if(!lua_isinteger(L, index))
 				throw std::runtime_error("expected integer, got " + actual);
 			return static_cast<T>(lua_tointeger(L, index));
@@ -586,10 +588,12 @@ class Lua
 	template <typename T>
 	static void push(lua_State* L, const T& value)
 	{
-		if constexpr(std::is_integral_v<T>)
+		if constexpr(std::is_same_v<T, bool>)
 		{
-			// bool: pushed as a Lua integer (1 = true, 0 = false), not as a Lua
-			// boolean. Lua code must test with == 1 / == 0, not == true / == false.
+			lua_pushboolean(L, value ? 1 : 0);
+		}
+		else if constexpr(std::is_integral_v<T>)
+		{
 			lua_pushinteger(L, static_cast<lua_Integer>(value));
 		}
 		else if constexpr(std::is_floating_point_v<T>)

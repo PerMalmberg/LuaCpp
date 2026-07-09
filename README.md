@@ -75,7 +75,7 @@ lua.run_script("assert(add(3, 4) == 7)");
 
 | C++ type | Lua type | Notes |
 |---|---|---|
-| `bool` | integer | `true` -> `1`, `false` -> `0`. See [Gotchas](#gotchas). |
+| `bool` | boolean | Native Lua boolean. |
 | `int`, `long` | integer | |
 | `float`, `double` | number | |
 | `std::string` | string | |
@@ -337,14 +337,6 @@ added to the Lua table by Lua code are left untouched.
 ---
 
 ## Gotchas
-
-### `bool` is not a Lua boolean
-
-`bool` is treated as an integer in both directions: `true` becomes `1` and
-`false` becomes `0` in Lua. Lua comparisons must use `== 1` / `== 0`, not
-`== true` / `== false`. If a Lua function returns a native boolean, reading
-it back as `bool` (or any integer type) will fail - convert in Lua first:
-`return b and 1 or 0`.
 
 ### `const char*` is push-only
 

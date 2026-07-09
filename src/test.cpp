@@ -1219,12 +1219,12 @@ LUA_REGISTER_STRUCT(Registry, lua_field("entries", &Registry::entries))
 // assign - remaining supported types
 // ============================================================
 
-TEST_CASE("assign: bool visible in Lua as integer (1/0)", "[assign]")
+TEST_CASE("assign: bool visible in Lua as boolean", "[assign]")
 {
 	Lua lua;
 	lua.assign("t", true);
 	lua.assign("f", false);
-	auto [ok, err] = lua.run_script("assert(t == 1 and f == 0)");
+	auto [ok, err] = lua.run_script("assert(t == true and f == false)");
 	REQUIRE(ok);
 }
 
@@ -1328,9 +1328,9 @@ TEST_CASE("assign: struct with map field (Registry) visible in Lua", "[assign][s
 // call<> - remaining type combinations
 // ============================================================
 
-TEST_CASE("call: bool arg (integer) and bool return", "[call]")
+TEST_CASE("call: bool arg and bool return", "[call]")
 {
-	// bool is integral: pushed/read as lua_Integer (true=1, false=0)
+	// bool maps to a native Lua boolean; true/false round-trip correctly.
 	Lua lua;
 	lua.run_script("function id(x) return x end");
 	auto [ok1, err1, r1] = lua.call<bool>("id", true);
@@ -1425,13 +1425,13 @@ TEST_CASE("call: Registry (struct with map field) round-trip", "[call][struct][m
 
 TEST_CASE("expose_func: bool arg and bool return", "[expose_func]")
 {
-	// bool is integral: Lua sees true as 1, false as 0
+	// bool maps to a native Lua boolean.
 	Lua lua;
 	lua.expose_func<bool>("logic_or", std::function<bool(bool, bool)>([](bool a, bool b) { return a || b; }));
 	auto [ok, err, result] = lua.call<bool>("logic_or", false, true);
 	REQUIRE(ok);
 	REQUIRE(result == true);
-	auto [ok2, err2] = lua.run_script("assert(logic_or(0, 0) == 0)");
+	auto [ok2, err2] = lua.run_script("assert(logic_or(false, false) == false)");
 	REQUIRE(ok2);
 }
 
