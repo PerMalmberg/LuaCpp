@@ -1198,3 +1198,587 @@ TEST_CASE("duplicate method: error message names the conflicting method", "[expo
 		REQUIRE_THAT(std::string(e.what()), Catch::Matchers::ContainsSubstring("my_method"));
 	}
 }
+
+// ============================================================
+// New struct types: container-valued fields
+// ============================================================
+
+struct Bag
+{
+	std::vector<int> items;
+};
+LUA_REGISTER_STRUCT(Bag, lua_field("items", &Bag::items))
+
+struct Registry
+{
+	std::map<std::string, int> entries;
+};
+LUA_REGISTER_STRUCT(Registry, lua_field("entries", &Registry::entries))
+
+// ============================================================
+// assign - remaining supported types
+// ============================================================
+
+TEST_CASE("assign: bool visible in Lua as integer (1/0)", "[assign]")
+{
+	Lua lua;
+	lua.assign("t", true);
+	lua.assign("f", false);
+	auto [ok, err] = lua.run_script("assert(t == 1 and f == 0)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("assign: long visible in Lua", "[assign]")
+{
+	Lua lua;
+	lua.assign("n", 1000000L);
+	auto [ok, err] = lua.run_script("assert(n == 1000000)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("assign: float visible in Lua", "[assign]")
+{
+	Lua lua;
+	lua.assign("x", 3.5f);
+	auto [ok, err] = lua.run_script("assert(x == 3.5)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("assign: struct (Point) visible in Lua as table", "[assign][struct]")
+{
+	Lua lua;
+	lua.assign("p", Point{7, 8});
+	auto [ok, err] = lua.run_script("assert(p.x == 7 and p.y == 8)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("assign: nested struct (Rect) visible in Lua as nested table", "[assign][struct]")
+{
+	Lua lua;
+	lua.assign("r", Rect{Point{1, 2}, 10, 20});
+	auto [ok, err] = lua.run_script("assert(r.origin.x == 1 and r.w == 10)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("assign: vector<int> visible in Lua as table", "[assign][vector]")
+{
+	Lua lua;
+	lua.assign("v", std::vector<int>{10, 20, 30});
+	auto [ok, err] = lua.run_script("assert(v[1] == 10 and v[2] == 20 and v[3] == 30)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("assign: vector<double> visible in Lua as table", "[assign][vector]")
+{
+	Lua lua;
+	lua.assign("v", std::vector<double>{1.5, 2.5});
+	auto [ok, err] = lua.run_script("assert(v[1] == 1.5 and v[2] == 2.5)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("assign: vector<string> visible in Lua as table", "[assign][vector]")
+{
+	Lua lua;
+	lua.assign("v", std::vector<std::string>{"a", "b", "c"});
+	auto [ok, err] = lua.run_script("assert(v[1] == 'a' and v[3] == 'c')");
+	REQUIRE(ok);
+}
+
+TEST_CASE("assign: vector<Point> visible in Lua as table of tables", "[assign][vector][struct]")
+{
+	Lua lua;
+	lua.assign("v", std::vector<Point>{{1, 2}, {3, 4}});
+	auto [ok, err] = lua.run_script("assert(v[1].x == 1 and v[2].y == 4)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("assign: map<string,int> visible in Lua as table", "[assign][map]")
+{
+	Lua lua;
+	lua.assign("m", std::map<std::string, int>{{"x", 10}, {"y", 20}});
+	auto [ok, err] = lua.run_script("assert(m.x == 10 and m.y == 20)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("assign: unordered_map<string,int> visible in Lua as table", "[assign][map]")
+{
+	Lua lua;
+	lua.assign("m", std::unordered_map<std::string, int>{{"a", 1}, {"b", 2}});
+	auto [ok, err] = lua.run_script("assert(m.a == 1 and m.b == 2)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("assign: struct with vector field (Bag) visible in Lua", "[assign][struct][vector]")
+{
+	Lua lua;
+	lua.assign("b", Bag{{1, 2, 3}});
+	auto [ok, err] = lua.run_script("assert(b.items[1] == 1 and b.items[3] == 3)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("assign: struct with map field (Registry) visible in Lua", "[assign][struct][map]")
+{
+	Lua lua;
+	lua.assign("reg", Registry{{{"score", 100}}});
+	auto [ok, err] = lua.run_script("assert(reg.entries.score == 100)");
+	REQUIRE(ok);
+}
+
+// ============================================================
+// call<> - remaining type combinations
+// ============================================================
+
+TEST_CASE("call: bool arg (integer) and bool return", "[call]")
+{
+	// bool is integral: pushed/read as lua_Integer (true=1, false=0)
+	Lua lua;
+	lua.run_script("function id(x) return x end");
+	auto [ok1, err1, r1] = lua.call<bool>("id", true);
+	REQUIRE(ok1);
+	REQUIRE(r1 == true);
+	auto [ok2, err2, r2] = lua.call<bool>("id", false);
+	REQUIRE(ok2);
+	REQUIRE(r2 == false);
+}
+
+TEST_CASE("call: vector<double> round-trip", "[call][vector]")
+{
+	Lua lua;
+	lua.run_script("function identity(t) return t end");
+	std::vector<double> input{1.1, 2.2, 3.3};
+	auto [ok, err, result] = lua.call<std::vector<double>>("identity", input);
+	REQUIRE(ok);
+	REQUIRE(result.size() == 3);
+	REQUIRE(result[0] == Catch::Approx(1.1));
+	REQUIRE(result[2] == Catch::Approx(3.3));
+}
+
+TEST_CASE("call: vector<Point> returned from Lua", "[call][vector][struct]")
+{
+	Lua lua;
+	lua.run_script("function make() return {{x=1,y=2},{x=3,y=4}} end");
+	auto [ok, err, result] = lua.call<std::vector<Point>>("make");
+	REQUIRE(ok);
+	REQUIRE(result.size() == 2);
+	REQUIRE(result[0].x == 1);
+	REQUIRE(result[1].y == 4);
+}
+
+TEST_CASE("call: map<int,string> arg and return", "[call][map]")
+{
+	Lua lua;
+	lua.run_script("function identity(t) return t end");
+	std::map<int, std::string> input{{1, "one"}, {2, "two"}};
+	auto [ok, err, result] = lua.call<std::map<int, std::string>>("identity", input);
+	REQUIRE(ok);
+	REQUIRE(result.at(1) == "one");
+	REQUIRE(result.at(2) == "two");
+}
+
+TEST_CASE("call: nested vector<vector<int>> round-trip", "[call][vector]")
+{
+	Lua lua;
+	lua.run_script("function identity(t) return t end");
+	std::vector<std::vector<int>> input{{1, 2}, {3, 4}, {5}};
+	auto [ok, err, result] = lua.call<std::vector<std::vector<int>>>("identity", input);
+	REQUIRE(ok);
+	REQUIRE(result.size() == 3);
+	REQUIRE(result[0] == std::vector<int>{1, 2});
+	REQUIRE(result[2] == std::vector<int>{5});
+}
+
+TEST_CASE("call: map<string,vector<int>> round-trip", "[call][map][vector]")
+{
+	Lua lua;
+	lua.run_script("function identity(t) return t end");
+	std::map<std::string, std::vector<int>> input{{"a", {1, 2}}, {"b", {3}}};
+	auto [ok, err, result] = lua.call<std::map<std::string, std::vector<int>>>("identity", input);
+	REQUIRE(ok);
+	REQUIRE(result.at("a") == std::vector<int>{1, 2});
+	REQUIRE(result.at("b") == std::vector<int>{3});
+}
+
+TEST_CASE("call: Bag (struct with vector field) round-trip", "[call][struct][vector]")
+{
+	Lua lua;
+	lua.run_script("function identity(b) return b end");
+	Bag bag{{10, 20, 30}};
+	auto [ok, err, result] = lua.call<Bag>("identity", bag);
+	REQUIRE(ok);
+	REQUIRE(result.items == std::vector<int>{10, 20, 30});
+}
+
+TEST_CASE("call: Registry (struct with map field) round-trip", "[call][struct][map]")
+{
+	Lua lua;
+	lua.run_script("function identity(r) return r end");
+	Registry reg{{{"x", 1}, {"y", 2}}};
+	auto [ok, err, result] = lua.call<Registry>("identity", reg);
+	REQUIRE(ok);
+	REQUIRE(result.entries.at("x") == 1);
+	REQUIRE(result.entries.at("y") == 2);
+}
+
+// ============================================================
+// expose_func - remaining types
+// ============================================================
+
+TEST_CASE("expose_func: bool arg and bool return", "[expose_func]")
+{
+	// bool is integral: Lua sees true as 1, false as 0
+	Lua lua;
+	lua.expose_func<bool>("logic_or", std::function<bool(bool, bool)>([](bool a, bool b) { return a || b; }));
+	auto [ok, err, result] = lua.call<bool>("logic_or", false, true);
+	REQUIRE(ok);
+	REQUIRE(result == true);
+	auto [ok2, err2] = lua.run_script("assert(logic_or(0, 0) == 0)");
+	REQUIRE(ok2);
+}
+
+TEST_CASE("expose_func: long arg and long return", "[expose_func]")
+{
+	Lua lua;
+	lua.expose_func<long>("double_long", std::function<long(long)>([](long x) { return x * 2L; }));
+	auto [ok, err, result] = lua.call<long>("double_long", 1000000L);
+	REQUIRE(ok);
+	REQUIRE(result == 2000000L);
+}
+
+TEST_CASE("expose_func: float arg and float return", "[expose_func]")
+{
+	Lua lua;
+	lua.expose_func<float>("half_float", std::function<float(float)>([](float x) { return x / 2.0f; }));
+	auto [ok, err, result] = lua.call<float>("half_float", 7.0f);
+	REQUIRE(ok);
+	REQUIRE(result == Catch::Approx(3.5f));
+}
+
+TEST_CASE("expose_func: vector<int> arg", "[expose_func][vector]")
+{
+	Lua lua;
+	lua.expose_func<int>("vec_sum", std::function<int(std::vector<int>)>(
+	                                [](std::vector<int> v)
+	                                {
+		                                int s = 0;
+		                                for(auto x : v)
+			                                s += x;
+		                                return s;
+	                                }));
+	auto [ok, err, result] = lua.call<int>("vec_sum", std::vector<int>{1, 2, 3, 4});
+	REQUIRE(ok);
+	REQUIRE(result == 10);
+}
+
+TEST_CASE("expose_func: vector<int> return", "[expose_func][vector]")
+{
+	Lua lua;
+	lua.expose_func<std::vector<int>>("range", std::function<std::vector<int>(int)>(
+	                                           [](int n)
+	                                           {
+		                                           std::vector<int> v;
+		                                           for(int i = 1; i <= n; ++i)
+			                                           v.push_back(i);
+		                                           return v;
+	                                           }));
+	auto [ok, err, result] = lua.call<std::vector<int>>("range", 4);
+	REQUIRE(ok);
+	REQUIRE(result == std::vector<int>{1, 2, 3, 4});
+}
+
+TEST_CASE("expose_func: vector<double> arg and return", "[expose_func][vector]")
+{
+	Lua lua;
+	lua.expose_func<std::vector<double>>("scale_vec", std::function<std::vector<double>(std::vector<double>, double)>(
+	                                                  [](std::vector<double> v, double f)
+	                                                  {
+		                                                  for(auto& x : v)
+			                                                  x *= f;
+		                                                  return v;
+	                                                  }));
+	auto [ok, err, result] = lua.call<std::vector<double>>("scale_vec", std::vector<double>{1.0, 2.0, 4.0}, 2.5);
+	REQUIRE(ok);
+	REQUIRE(result[0] == Catch::Approx(2.5));
+	REQUIRE(result[1] == Catch::Approx(5.0));
+	REQUIRE(result[2] == Catch::Approx(10.0));
+}
+
+TEST_CASE("expose_func: vector<string> arg and return", "[expose_func][vector]")
+{
+	Lua lua;
+	lua.expose_func<std::vector<std::string>>("exclaim",
+	                                          std::function<std::vector<std::string>(std::vector<std::string>)>(
+	                                          [](std::vector<std::string> v)
+	                                          {
+		                                          for(auto& s : v)
+			                                          s += "!";
+		                                          return v;
+	                                          }));
+	auto [ok, err, result] = lua.call<std::vector<std::string>>("exclaim", std::vector<std::string>{"hi", "bye"});
+	REQUIRE(ok);
+	REQUIRE(result[0] == "hi!");
+	REQUIRE(result[1] == "bye!");
+}
+
+TEST_CASE("expose_func: vector<Point> arg and return", "[expose_func][vector][struct]")
+{
+	Lua lua;
+	lua.expose_func<std::vector<Point>>("shift_all", std::function<std::vector<Point>(std::vector<Point>, int, int)>(
+	                                                 [](std::vector<Point> pts, int dx, int dy)
+	                                                 {
+		                                                 for(auto& p : pts)
+		                                                 {
+			                                                 p.x += dx;
+			                                                 p.y += dy;
+		                                                 }
+		                                                 return pts;
+	                                                 }));
+	auto [ok, err, result] = lua.call<std::vector<Point>>("shift_all", std::vector<Point>{{1, 2}, {3, 4}}, 10, 10);
+	REQUIRE(ok);
+	REQUIRE(result[0].x == 11);
+	REQUIRE(result[1].y == 14);
+}
+
+TEST_CASE("expose_func: map<string,int> arg", "[expose_func][map]")
+{
+	Lua lua;
+	lua.expose_func<int>("map_sum", std::function<int(std::map<std::string, int>)>(
+	                                [](std::map<std::string, int> m)
+	                                {
+		                                int s = 0;
+		                                for(auto& [k, v] : m)
+			                                s += v;
+		                                return s;
+	                                }));
+	auto [ok, err, result] = lua.call<int>("map_sum", std::map<std::string, int>{{"a", 1}, {"b", 2}, {"c", 3}});
+	REQUIRE(ok);
+	REQUIRE(result == 6);
+}
+
+TEST_CASE("expose_func: map<string,int> return", "[expose_func][map]")
+{
+	Lua lua;
+	lua.expose_func<std::map<std::string, int>>("make_counters",
+	                                            std::function<std::map<std::string, int>(int)>(
+	                                            [](int n)
+	                                            { return std::map<std::string, int>{{"n", n}, {"n2", n * n}}; }));
+	auto [ok, err, result] = lua.call<std::map<std::string, int>>("make_counters", 3);
+	REQUIRE(ok);
+	REQUIRE(result.at("n") == 3);
+	REQUIRE(result.at("n2") == 9);
+}
+
+TEST_CASE("expose_func: unordered_map<string,int> arg and return", "[expose_func][map]")
+{
+	Lua lua;
+	lua.expose_func<std::unordered_map<std::string, int>>("negate_all",
+	                                                      std::function<std::unordered_map<std::string, int>(
+	                                                      std::unordered_map<std::string, int>)>(
+	                                                      [](std::unordered_map<std::string, int> m)
+	                                                      {
+		                                                      for(auto& [k, v] : m)
+			                                                      v = -v;
+		                                                      return m;
+	                                                      }));
+	std::unordered_map<std::string, int> input{{"x", 5}, {"y", 10}};
+	auto [ok, err, result] = lua.call<std::unordered_map<std::string, int>>("negate_all", input);
+	REQUIRE(ok);
+	REQUIRE(result.at("x") == -5);
+	REQUIRE(result.at("y") == -10);
+}
+
+TEST_CASE("expose_func: nested struct (Rect) arg and return", "[expose_func][struct]")
+{
+	Lua lua;
+	lua.expose_func<Rect>("scale_rect",
+	                      std::function<Rect(Rect, int)>(
+	                      [](Rect r, int f) { return Rect{Point{r.origin.x * f, r.origin.y * f}, r.w * f, r.h * f}; }));
+	auto [ok, err, result] = lua.call<Rect>("scale_rect", Rect{Point{1, 2}, 3, 4}, 2);
+	REQUIRE(ok);
+	REQUIRE(result.origin.x == 2);
+	REQUIRE(result.origin.y == 4);
+	REQUIRE(result.w == 6);
+	REQUIRE(result.h == 8);
+}
+
+TEST_CASE("expose_func: Bag (struct with vector field) arg and return", "[expose_func][struct][vector]")
+{
+	Lua lua;
+	lua.expose_func<Bag>("bag_append", std::function<Bag(Bag, int)>(
+	                                   [](Bag b, int x)
+	                                   {
+		                                   b.items.push_back(x);
+		                                   return b;
+	                                   }));
+	auto [ok, err, result] = lua.call<Bag>("bag_append", Bag{{1, 2}}, 3);
+	REQUIRE(ok);
+	REQUIRE(result.items == std::vector<int>{1, 2, 3});
+}
+
+TEST_CASE("expose_func: Registry (struct with map field) arg and return", "[expose_func][struct][map]")
+{
+	Lua lua;
+	lua.expose_func<Registry>("reg_insert", std::function<Registry(Registry, std::string, int)>(
+	                                        [](Registry r, std::string k, int v)
+	                                        {
+		                                        r.entries[k] = v;
+		                                        return r;
+	                                        }));
+	auto [ok, err, result] = lua.call<Registry>("reg_insert", Registry{{}}, std::string("score"), 99);
+	REQUIRE(ok);
+	REQUIRE(result.entries.at("score") == 99);
+}
+
+// ============================================================
+// expose_method - container arg / return types
+// ============================================================
+
+TEST_CASE("expose_method: vector<int> return", "[expose_method][vector]")
+{
+	Lua lua;
+	lua.expose_method<Point, std::vector<int>>("as_vec", std::function<std::vector<int>(Point)>(
+	                                                     [](Point p) { return std::vector<int>{p.x, p.y}; }));
+	lua.assign("p", Point{5, 6});
+	lua.run_script("function get_vec() return p:as_vec() end");
+	auto [ok, err, result] = lua.call<std::vector<int>>("get_vec");
+	REQUIRE(ok);
+	REQUIRE(result == std::vector<int>{5, 6});
+}
+
+TEST_CASE("expose_method: vector<Point> arg", "[expose_method][vector][struct]")
+{
+	Lua lua;
+	lua.expose_method<Point, int>("dot_sum", std::function<int(Point, std::vector<Point>)>(
+	                                         [](Point p, std::vector<Point> others)
+	                                         {
+		                                         int s = 0;
+		                                         for(auto& o : others)
+			                                         s += p.x * o.x + p.y * o.y;
+		                                         return s;
+	                                         }));
+	lua.assign("p", Point{1, 2});
+	// (1*3 + 2*4) + (1*1 + 2*1) = 11 + 3 = 14
+	lua.run_script("function calc() return p:dot_sum({{x=3,y=4},{x=1,y=1}}) end");
+	auto [ok, err, result] = lua.call<int>("calc");
+	REQUIRE(ok);
+	REQUIRE(result == 14);
+}
+
+TEST_CASE("expose_method: map<string,int> return", "[expose_method][map]")
+{
+	Lua lua;
+	lua.expose_method<Point, std::map<std::string, int>>("as_map", std::function<std::map<std::string, int>(Point)>(
+	                                                               [](Point p)
+	                                                               {
+		                                                               return std::map<std::string, int>{{"x", p.x},
+		                                                                                                 {"y", p.y}};
+	                                                               }));
+	lua.assign("p", Point{7, 8});
+	lua.run_script("function get_map() return p:as_map() end");
+	auto [ok, err, result] = lua.call<std::map<std::string, int>>("get_map");
+	REQUIRE(ok);
+	REQUIRE(result.at("x") == 7);
+	REQUIRE(result.at("y") == 8);
+}
+
+TEST_CASE("expose_method: Bag::sum — method on struct with vector field", "[expose_method][struct][vector]")
+{
+	Lua lua;
+	lua.expose_method<Bag, int>("sum", std::function<int(Bag)>(
+	                                   [](Bag b)
+	                                   {
+		                                   int s = 0;
+		                                   for(auto x : b.items)
+			                                   s += x;
+		                                   return s;
+	                                   }));
+	lua.assign("b", Bag{{1, 2, 3, 4}});
+	auto [ok, err] = lua.run_script("assert(b:sum() == 10)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("expose_method: Registry::lookup — method with map field and string arg", "[expose_method][struct][map]")
+{
+	Lua lua;
+	lua.expose_method<Registry, int>("lookup", std::function<int(Registry, std::string)>(
+	                                           [](Registry r, std::string k)
+	                                           { return r.entries.count(k) ? r.entries.at(k) : -1; }));
+	lua.assign("reg", Registry{{{"x", 42}}});
+	auto [ok1, err1] = lua.run_script("assert(reg:lookup('x') == 42)");
+	REQUIRE(ok1);
+	auto [ok2, err2] = lua.run_script("assert(reg:lookup('missing') == -1)");
+	REQUIRE(ok2);
+}
+
+// ============================================================
+// expose_mutable_method - container-field mutations
+// ============================================================
+
+TEST_CASE("expose_mutable_method: Bag::push_item appends to vector field in place",
+          "[expose_mutable_method][struct][vector]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Bag>("push_item",
+	                               std::function<void(Bag&, int)>([](Bag& b, int x) { b.items.push_back(x); }));
+	lua.assign("b", Bag{{1, 2}});
+	lua.run_script("b:push_item(3)");
+	lua.run_script("b:push_item(4)");
+	auto [ok, err] = lua.run_script("assert(b.items[3] == 3 and b.items[4] == 4)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("expose_mutable_method: Bag::clear empties vector field in place", "[expose_mutable_method][struct][vector]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Bag>("clear", std::function<void(Bag&)>([](Bag& b) { b.items.clear(); }));
+	lua.assign("b", Bag{{1, 2, 3}});
+	lua.run_script("b:clear()");
+	auto [ok, err] = lua.run_script("assert(#b.items == 0)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("expose_mutable_method: Bag::pop — scalar return plus vector mutation",
+          "[expose_mutable_method][struct][vector]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Bag, int>("pop", std::function<int(Bag&)>(
+	                                           [](Bag& b)
+	                                           {
+		                                           if(b.items.empty())
+			                                           return -1;
+		                                           int v = b.items.back();
+		                                           b.items.pop_back();
+		                                           return v;
+	                                           }));
+	lua.assign("b", Bag{{10, 20, 30}});
+	lua.run_script("function do_pop() return b:pop() end");
+	auto [ok1, err1, v1] = lua.call<int>("do_pop");
+	REQUIRE(ok1);
+	REQUIRE(v1 == 30);
+	auto [ok2, err2] = lua.run_script("assert(#b.items == 2)");
+	REQUIRE(ok2);
+}
+
+TEST_CASE("expose_mutable_method: Registry::set inserts into map field in place",
+          "[expose_mutable_method][struct][map]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Registry>("set", std::function<void(Registry&, std::string, int)>(
+	                                           [](Registry& r, std::string k, int v) { r.entries[k] = v; }));
+	lua.assign("reg", Registry{{}});
+	lua.run_script("reg:set('score', 42)");
+	lua.run_script("reg:set('level', 7)");
+	auto [ok, err] = lua.run_script("assert(reg.entries.score == 42 and reg.entries.level == 7)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("expose_mutable_method: Registry::erase removes from map field in place",
+          "[expose_mutable_method][struct][map]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Registry>("erase", std::function<void(Registry&, std::string)>(
+	                                             [](Registry& r, std::string k) { r.entries.erase(k); }));
+	lua.assign("reg", Registry{{{"x", 1}, {"y", 2}}});
+	lua.run_script("reg:erase('x')");
+	auto [ok, err] = lua.run_script("assert(reg.entries.x == nil and reg.entries.y == 2)");
+	REQUIRE(ok);
+}
