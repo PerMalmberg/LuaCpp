@@ -915,3 +915,286 @@ TEST_CASE("expose_method: data modified alternately by C++ and Lua", "[expose_me
 	REQUIRE(p3.x == 12); // (5+1)*2
 	REQUIRE(p3.y == 14); // (6+1)*2
 }
+// ============================================================
+// expose_mutable_method - struct mutable methods
+// ============================================================
+
+TEST_CASE("expose_mutable_method: void return, no extra args", "[expose_mutable_method]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point>("negate", std::function<void(Point&)>(
+	                                           [](Point& p)
+	                                           {
+		                                           p.x = -p.x;
+		                                           p.y = -p.y;
+	                                           }));
+	lua.assign("p", Point{3, 4});
+	lua.run_script("p:negate()");
+	auto [ok, err] = lua.run_script("assert(p.x == -3 and p.y == -4)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("expose_mutable_method: void return, with extra args", "[expose_mutable_method]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point>("translate", std::function<void(Point&, int, int)>(
+	                                              [](Point& p, int dx, int dy)
+	                                              {
+		                                              p.x += dx;
+		                                              p.y += dy;
+	                                              }));
+	lua.assign("p", Point{1, 2});
+	lua.run_script("p:translate(10, 20)");
+	auto [ok, err] = lua.run_script("assert(p.x == 11 and p.y == 22)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("expose_mutable_method: scalar return, also modifies self", "[expose_mutable_method]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point, int>("scale_and_sum", std::function<int(Point&, int)>(
+	                                                       [](Point& p, int f)
+	                                                       {
+		                                                       p.x *= f;
+		                                                       p.y *= f;
+		                                                       return p.x + p.y;
+	                                                       }));
+	lua.assign("p", Point{3, 4});
+	// Return value is 14 (6 + 8), and the table must be updated
+	auto [ok1, err1] = lua.run_script("assert(p:scale_and_sum(2) == 14)");
+	REQUIRE(ok1);
+	auto [ok2, err2] = lua.run_script("assert(p.x == 6 and p.y == 8)");
+	REQUIRE(ok2);
+}
+
+TEST_CASE("expose_mutable_method: multiple return values, also modifies self", "[expose_mutable_method]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point, int, int>("scale_and_components", std::function<std::tuple<int, int>(Point&, int)>(
+	                                                                   [](Point& p, int f)
+	                                                                   {
+		                                                                   p.x *= f;
+		                                                                   p.y *= f;
+		                                                                   return std::make_tuple(p.x, p.y);
+	                                                                   }));
+	lua.assign("p", Point{3, 4});
+	lua.run_script("function get() return p:scale_and_components(2) end");
+	auto [ok, err, x, y] = lua.call<int, int>("get");
+	REQUIRE(ok);
+	REQUIRE(x == 6);
+	REQUIRE(y == 8);
+	// Write-back must also have updated the table
+	auto [ok2, err2] = lua.run_script("assert(p.x == 6 and p.y == 8)");
+	REQUIRE(ok2);
+}
+
+TEST_CASE("expose_mutable_method: sequential calls accumulate state", "[expose_mutable_method]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point>("translate", std::function<void(Point&, int, int)>(
+	                                              [](Point& p, int dx, int dy)
+	                                              {
+		                                              p.x += dx;
+		                                              p.y += dy;
+	                                              }));
+	lua.assign("p", Point{0, 0});
+	lua.run_script("p:translate(1, 2)");
+	lua.run_script("p:translate(3, 4)");
+	auto [ok, err] = lua.run_script("assert(p.x == 4 and p.y == 6)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("expose_mutable_method: mixed with immutable method on same type", "[expose_mutable_method]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point>("scale", std::function<void(Point&, int)>(
+	                                          [](Point& p, int f)
+	                                          {
+		                                          p.x *= f;
+		                                          p.y *= f;
+	                                          }));
+	lua.expose_method<Point, int>("magnitude_sq",
+	                              std::function<int(Point)>([](Point p) { return p.x * p.x + p.y * p.y; }));
+	lua.assign("p", Point{3, 4});
+	lua.run_script("p:scale(2)"); // p becomes {6, 8}
+	auto [ok, err] = lua.run_script("assert(p:magnitude_sq() == 100)"); // 36 + 64
+	REQUIRE(ok);
+}
+
+TEST_CASE("expose_mutable_method: modifies nested struct field in place", "[expose_mutable_method]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point>("translate", std::function<void(Point&, int, int)>(
+	                                              [](Point& p, int dx, int dy)
+	                                              {
+		                                              p.x += dx;
+		                                              p.y += dy;
+	                                              }));
+	lua.assign("r", Rect{Point{1, 2}, 10, 20});
+	// r.origin is a Lua table reference; the write-back must update it in place
+	lua.run_script("r.origin:translate(5, 5)");
+	auto [ok, err] = lua.run_script("assert(r.origin.x == 6 and r.origin.y == 7)");
+	REQUIRE(ok);
+}
+
+// expose_mutable_method - error cases
+
+TEST_CASE("expose_mutable_method error: too many arguments", "[expose_mutable_method]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point>("negate", std::function<void(Point&)>(
+	                                           [](Point& p)
+	                                           {
+		                                           p.x = -p.x;
+		                                           p.y = -p.y;
+	                                           }));
+	lua.assign("p", Point{1, 2});
+	auto [ok, err] = lua.run_script("p:negate(99)"); // one extra arg beyond self
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected 0"));
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("got 1"));
+}
+
+TEST_CASE("expose_mutable_method error: too few arguments", "[expose_mutable_method]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point>("translate", std::function<void(Point&, int, int)>(
+	                                              [](Point& p, int dx, int dy)
+	                                              {
+		                                              p.x += dx;
+		                                              p.y += dy;
+	                                              }));
+	lua.assign("p", Point{1, 2});
+	auto [ok, err] = lua.run_script("p:translate(5)"); // missing second arg
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected 2"));
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("got 1"));
+}
+
+TEST_CASE("expose_mutable_method error: wrong argument type", "[expose_mutable_method]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point>("translate", std::function<void(Point&, int, int)>(
+	                                              [](Point& p, int dx, int dy)
+	                                              {
+		                                              p.x += dx;
+		                                              p.y += dy;
+	                                              }));
+	lua.assign("p", Point{1, 2});
+	auto [ok, err] = lua.run_script("p:translate('bad', 1)"); // string instead of integer
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected integer"));
+}
+
+// expose_mutable_method - stack hygiene
+
+TEST_CASE("expose_mutable_method stack hygiene: callable multiple times without leak", "[expose_mutable_method][stack]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point>("increment", std::function<void(Point&)>(
+	                                              [](Point& p)
+	                                              {
+		                                              ++p.x;
+		                                              ++p.y;
+	                                              }));
+	lua.assign("p", Point{0, 0});
+	for(int i = 0; i < 10; ++i)
+	{
+		auto [ok, err] = lua.run_script("p:increment()");
+		REQUIRE(ok);
+	}
+	auto [ok, err] = lua.run_script("assert(p.x == 10 and p.y == 10)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("expose_mutable_method stack hygiene: succeeds after an error", "[expose_mutable_method][stack]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point>("translate", std::function<void(Point&, int, int)>(
+	                                              [](Point& p, int dx, int dy)
+	                                              {
+		                                              p.x += dx;
+		                                              p.y += dy;
+	                                              }));
+	lua.assign("p", Point{0, 0});
+
+	// Trigger an argument count error
+	auto [ok1, err1] = lua.run_script("p:translate(1)"); // missing second arg
+	REQUIRE_FALSE(ok1);
+
+	// Stack must be clean; next call must succeed and accumulate correctly
+	auto [ok2, err2] = lua.run_script("p:translate(3, 4)");
+	REQUIRE(ok2);
+	auto [ok3, err3] = lua.run_script("assert(p.x == 3 and p.y == 4)");
+	REQUIRE(ok3);
+}
+
+// ============================================================
+// Duplicate method name detection
+// ============================================================
+
+TEST_CASE("duplicate method: expose_method then expose_mutable_method throws", "[expose_method][expose_mutable_method]")
+{
+	Lua lua;
+	lua.expose_method<Point, int>("foo", std::function<int(Point)>([](Point p) { return p.x + p.y; }));
+	REQUIRE_THROWS_AS(lua.expose_mutable_method<Point>("foo", std::function<void(Point&)>([](Point&) {})),
+	                  std::runtime_error);
+}
+
+TEST_CASE("duplicate method: expose_mutable_method then expose_method throws", "[expose_method][expose_mutable_method]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point>("bar", std::function<void(Point&)>([](Point&) {}));
+	REQUIRE_THROWS_AS((lua.expose_method<Point, int>("bar",
+	                                                 std::function<int(Point)>([](Point p) { return p.x + p.y; }))),
+	                  std::runtime_error);
+}
+
+TEST_CASE("duplicate method: expose_method twice with same name throws", "[expose_method]")
+{
+	Lua lua;
+	lua.expose_method<Point, int>("baz", std::function<int(Point)>([](Point p) { return p.x + p.y; }));
+	REQUIRE_THROWS_AS((lua.expose_method<Point, int>("baz",
+	                                                 std::function<int(Point)>([](Point p) { return p.x - p.y; }))),
+	                  std::runtime_error);
+}
+
+TEST_CASE("duplicate method: expose_mutable_method twice with same name throws", "[expose_mutable_method]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point>("qux", std::function<void(Point&)>([](Point& p) { p.x = 0; }));
+	REQUIRE_THROWS_AS(lua.expose_mutable_method<Point>("qux", std::function<void(Point&)>([](Point& p) { p.y = 0; })),
+	                  std::runtime_error);
+}
+
+TEST_CASE("duplicate method: same name on different types is allowed", "[expose_method][expose_mutable_method]")
+{
+	// 'value' registered on Point must not block 'value' being registered on Rect.
+	Lua lua;
+	REQUIRE_NOTHROW(
+	(lua.expose_method<Point, int>("value", std::function<int(Point)>([](Point p) { return p.x + p.y; }))));
+	REQUIRE_NOTHROW(
+	(lua.expose_method<Rect, int>("value", std::function<int(Rect)>([](Rect r) { return r.w * r.h; }))));
+
+	lua.assign("p", Point{3, 4});
+	lua.assign("r", Rect{Point{0, 0}, 5, 6});
+	auto [ok1, err1] = lua.run_script("assert(p:value() == 7)");
+	auto [ok2, err2] = lua.run_script("assert(r:value() == 30)");
+	REQUIRE(ok1);
+	REQUIRE(ok2);
+}
+
+TEST_CASE("duplicate method: error message names the conflicting method", "[expose_method][expose_mutable_method]")
+{
+	Lua lua;
+	lua.expose_method<Point, int>("my_method", std::function<int(Point)>([](Point p) { return p.x; }));
+	try
+	{
+		lua.expose_mutable_method<Point>("my_method", std::function<void(Point&)>([](Point&) {}));
+		FAIL("expected exception was not thrown");
+	}
+	catch(const std::runtime_error& e)
+	{
+		REQUIRE_THAT(std::string(e.what()), Catch::Matchers::ContainsSubstring("my_method"));
+	}
+}

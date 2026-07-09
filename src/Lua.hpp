@@ -310,6 +310,77 @@ class Lua
 		add_method_to_registry<StructType>(*this, name, fn_ptr);
 	}
 
+	// Registers a C++ callable as a named mutating method on all Lua instances of StructType.
+	//
+	// Unlike expose_method, the C++ function receives self as a non-const reference
+	// (StructType&). Any modifications made to self are written back into the caller's
+	// Lua table before the closure returns, enabling true in-place mutation:
+	//
+	//   p:translate(1, 1)   -- p.x and p.y are modified in place in the Lua table
+	//
+	// StructType is always the first explicit template argument.
+	// ReturnTypes follow the same convention as expose_method:
+	//   omit for void, one type for a scalar return, multiple for a tuple.
+	// The C++ function receives self by reference as its first argument;
+	// any additional arguments follow in order.
+	//
+	// Example - void return, modifies self:
+	//   lua.expose_mutable_method<Point>("translate",
+	//       std::function<void(Point&, int, int)>(
+	//           [](Point& p, int dx, int dy){ p.x += dx; p.y += dy; }));
+	//
+	// Example - scalar return, also modifies self:
+	//   lua.expose_mutable_method<Point, int>("scale_and_sum",
+	//       std::function<int(Point&, int)>(
+	//           [](Point& p, int f){ p.x *= f; p.y *= f; return p.x + p.y; }));
+	template <typename StructType, typename... ReturnTypes, typename... Args>
+	void expose_mutable_method(const char* name, std::function<lua_return_t<ReturnTypes...>(StructType&, Args...)> func)
+	{
+		static_assert(has_lua_fields<StructType>::value,
+		              "expose_mutable_method: StructType must be registered with LUA_REGISTER_STRUCT");
+
+		auto wrapper = std::make_unique<LuaFunc>(
+		[func = std::move(func)](lua_State* L) -> int
+		{
+			constexpr int n_method_args = static_cast<int>(sizeof...(Args));
+			constexpr int expected = n_method_args + 1; // +1 for implicit self
+			if(const int got = lua_gettop(L); got != expected)
+				throw std::runtime_error("expected " + std::to_string(n_method_args) + " argument(s), got " +
+				                         std::to_string(got - 1));
+
+			auto self = read<StructType>(L, 1);
+			auto extra_args = collect_method_args<Args...>(L, std::index_sequence_for<Args...>{});
+
+			if constexpr(sizeof...(ReturnTypes) == 0)
+			{
+				std::apply([&](auto&&... a) { func(self, std::forward<decltype(a)>(a)...); }, std::move(extra_args));
+				write_struct_back(L, 1, self);
+				return 0;
+			}
+			else if constexpr(sizeof...(ReturnTypes) == 1)
+			{
+				auto result = std::apply([&](auto&&... a) { return func(self, std::forward<decltype(a)>(a)...); },
+				                         std::move(extra_args));
+				write_struct_back(L, 1, self);
+				push(L, result);
+				return 1;
+			}
+			else
+			{
+				auto results = std::apply([&](auto&&... a) { return func(self, std::forward<decltype(a)>(a)...); },
+				                          std::move(extra_args));
+				write_struct_back(L, 1, self);
+				push_results(L, results, std::index_sequence_for<ReturnTypes...>{});
+				return static_cast<int>(sizeof...(ReturnTypes));
+			}
+		});
+
+		registered_funcs.push_back(std::move(wrapper));
+		LuaFunc* fn_ptr = registered_funcs.back().get();
+
+		add_method_to_registry<StructType>(*this, name, fn_ptr);
+	}
+
   private:
 	using LuaCloser = std::function<void(lua_State*)>;
 	using LuaStatePtr = std::unique_ptr<lua_State, LuaCloser>;
@@ -526,6 +597,27 @@ class Lua
 		lua_pop(L, 1);
 	}
 
+	// Writes one field from a C++ struct back into an existing Lua table at idx.
+	// The counterpart of push_struct_field; used by expose_mutable_method to
+	// propagate self mutations back to the Lua-side table.
+	template <typename Struct, typename Member>
+	static void write_struct_field_back(lua_State* L, int idx, const Struct& s, const LuaField<Struct, Member>& f)
+	{
+		push(L, s.*f.ptr);
+		lua_setfield(L, idx, f.name); // table[f.name] = value; pops the value
+	}
+
+	// Writes all registered fields of s back into the Lua table at idx.
+	// Used by expose_mutable_method after calling the C++ handler so that any
+	// modifications made to self are reflected in the caller's Lua table.
+	template <typename T>
+	static void write_struct_back(lua_State* L, int idx, const T& s)
+	{
+		const int abs = lua_absindex(L, idx);
+		std::apply([&](const auto&... fields) { (write_struct_field_back(L, abs, s, fields), ...); },
+		           LuaFields<T>::value);
+	}
+
 	// ---------------------------------------------------------------------------
 	// Struct method dispatch
 	// ---------------------------------------------------------------------------
@@ -579,24 +671,38 @@ class Lua
 		{
 			lua_pop(L, 1);
 
-			lua_newtable(L);                      // metatable
-			lua_newtable(L);                      // __index table
-			lua_setfield(L, -2, "__index");       // metatable.__index = {}
+			lua_newtable(L); // metatable
+			lua_newtable(L); // __index table
+			lua_setfield(L, -2, "__index"); // metatable.__index = {}
 
 			lua_pushlightuserdata(L, const_cast<void*>(get_type_key<T>()));
-			lua_pushvalue(L, -2);                 // duplicate metatable
-			lua_rawset(L, LUA_REGISTRYINDEX);     // registry[type_key] = metatable
+			lua_pushvalue(L, -2); // duplicate metatable
+			lua_rawset(L, LUA_REGISTRYINDEX); // registry[type_key] = metatable
 			// stack: [metatable]
 		}
 		// stack: [metatable]
 
-		lua_getfield(L, -1, "__index");           // stack: [metatable, __index_table]
+		lua_getfield(L, -1, "__index"); // stack: [metatable, __index_table]
+
+		// Guard against duplicate registration: if `name` already exists in the
+		// __index table a second expose_method / expose_mutable_method call with
+		// the same name would silently overwrite the first.  Throw instead so the
+		// mistake is caught at registration time rather than producing mysterious
+		// runtime behaviour.
+		lua_getfield(L, -1, name); // stack: [metatable, __index_table, existing_or_nil]
+		const bool duplicate = !lua_isnil(L, -1);
+		lua_pop(L, 1); // stack: [metatable, __index_table]
+		if(duplicate)
+		{
+			lua_pop(L, 2); // restore stack balance before throwing
+			throw std::runtime_error(std::string("method '") + name + "' is already registered on this type");
+		}
 
 		lua_pushlightuserdata(L, fn_ptr);
 		lua_pushcclosure(L, &Lua::trampoline, 1); // stack: [metatable, __index_table, closure]
-		lua_setfield(L, -2, name);                // __index_table[name] = closure
+		lua_setfield(L, -2, name); // __index_table[name] = closure
 
-		lua_pop(L, 2);                            // pop __index_table and metatable
+		lua_pop(L, 2); // pop __index_table and metatable
 	}
 
 	// Attaches T's method metatable (if any) to the table currently on top of the
