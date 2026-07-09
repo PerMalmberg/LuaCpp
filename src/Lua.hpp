@@ -128,7 +128,7 @@ struct is_std_map<std::unordered_map<K, V, H, E, A>> : std::true_type
 {
 };
 
-class Lua
+class Lua final
 {
   public:
 	Lua()
@@ -136,13 +136,22 @@ class Lua
 		luaL_openlibs(*this);
 	}
 
-	virtual ~Lua()
-	{
-	}
+	~Lua() = default;
+
+	Lua(const Lua&) = delete;
+	Lua& operator=(const Lua&) = delete;
+	Lua(Lua&&) = delete;
+	Lua& operator=(Lua&&) = delete;
 
 	std::tuple<bool, std::string> run_script(const char* script)
 	{
-		if(luaL_dostring(*this, script) != LUA_OK)
+		// Use luaL_loadstring + lua_pcall(L,0,0,0) to discard script return values and prevent stack
+		// growth on repeated calls
+		if(luaL_loadstring(*this, script) != LUA_OK)
+		{
+			return {false, get_error_message()};
+		}
+		if(lua_pcall(*this, 0, 0, 0) != LUA_OK)
 		{
 			return {false, get_error_message()};
 		}
@@ -160,9 +169,9 @@ class Lua
 	//   Subsequent Lua-side mutations to the table do not affect the original
 	//   C++ object.
 	template <typename T>
-	void assign(const char* name, const T value)
+	void assign(const char* name, const T& value)
 	{
-		push(state.get(), value);
+		push(state.get(), decay_for_push(value));
 		lua_setglobal(*this, name);
 	}
 
@@ -180,7 +189,7 @@ class Lua
 	// On any failure the first tuple element is false and the second is the
 	// error message; all ReturnType slots hold their zero-initialised defaults.
 	template <typename... ReturnTypes, typename... Args>
-	std::tuple<bool, std::string, ReturnTypes...> call(const char* func, Args... args)
+	std::tuple<bool, std::string, ReturnTypes...> call(const char* func, Args&&... args)
 	{
 		lua_getglobal(*this, func);
 		if(!lua_isfunction(*this, TOP_OF_STACK))
@@ -189,7 +198,8 @@ class Lua
 			return {false, "Not a function: " + std::string(func), ReturnTypes{}...};
 		}
 
-		(push(state.get(), args), ...); // C++17 fold expression to push all arguments onto the Lua stack
+		(push(state.get(), decay_for_push(std::forward<Args>(args))),
+		 ...); // C++17 fold expression to push all arguments onto the Lua stack
 
 		const auto arg_count = static_cast<int>(sizeof...(Args));
 		const auto ret_count = static_cast<int>(sizeof...(ReturnTypes));
@@ -260,7 +270,7 @@ class Lua
 				throw std::runtime_error("expected " + std::to_string(expected) + " argument(s), got " +
 				                         std::to_string(got));
 
-			auto args = collect_args<Args...>(L, std::index_sequence_for<Args...>{});
+			auto args = collect_args_from<Args...>(L, 1, std::index_sequence_for<Args...>{});
 
 			if constexpr(sizeof...(ReturnTypes) == 0)
 			{
@@ -336,7 +346,7 @@ class Lua
 				                         std::to_string(got - 1));
 
 			auto self = read<StructType>(L, 1);
-			auto args = collect_method_args<Args...>(L, std::index_sequence_for<Args...>{});
+			auto args = collect_args_from<Args...>(L, 2, std::index_sequence_for<Args...>{});
 			auto all_args = std::tuple_cat(std::make_tuple(std::move(self)), std::move(args));
 
 			if constexpr(sizeof...(ReturnTypes) == 0)
@@ -414,7 +424,7 @@ class Lua
 				                         std::to_string(got - 1));
 
 			auto self = read<StructType>(L, 1);
-			auto extra_args = collect_method_args<Args...>(L, std::index_sequence_for<Args...>{});
+			auto extra_args = collect_args_from<Args...>(L, 2, std::index_sequence_for<Args...>{});
 
 			if constexpr(sizeof...(ReturnTypes) == 0)
 			{
@@ -456,10 +466,10 @@ class Lua
 	//  1 = bottom, 2 = second from bottom, etc.
 	static constexpr int TOP_OF_STACK = -1;
 
-	const std::string get_error_message() const
+	const std::string get_error_message()
 	{
-		const std::string error = lua_tostring(*this, TOP_OF_STACK);
-		lua_pop(*this, 1);
+		const std::string error = luaL_tolstring(*this, TOP_OF_STACK, nullptr);
+		lua_pop(*this, 2); // pop original error object + string pushed by luaL_tolstring
 		return error;
 	}
 
@@ -511,9 +521,14 @@ class Lua
 		{
 			// lua_isstring returns true for Lua numbers (implicit coercion), so a
 			// Lua integer or float value can be read back as std::string.
+			// lua_tolstring is used (not lua_tostring) so that the explicit byte
+			// length is obtained; this preserves embedded null bytes that
+			// std::string{lua_tostring(...)} would otherwise truncate.
 			if(!lua_isstring(L, index))
 				throw std::runtime_error("expected string, got " + actual);
-			return {lua_tostring(L, index)};
+			std::size_t len = 0;
+			const char* ptr = lua_tolstring(L, index, &len);
+			return {ptr, len};
 		}
 		else if constexpr(std::is_same_v<T, const char*>)
 		{
@@ -602,7 +617,7 @@ class Lua
 		}
 		else if constexpr(std::is_same_v<T, std::string>)
 		{
-			lua_pushstring(L, value.c_str());
+			lua_pushlstring(L, value.c_str(), value.size());
 		}
 		else if constexpr(std::is_same_v<T, const char*>)
 		{
@@ -630,7 +645,7 @@ class Lua
 			{
 				push(L, k);
 				push(L, v);
-				lua_settable(L, -3); // table is at -3 after pushing key and value
+				lua_rawset(L, -3); // table is at -3 after pushing key and value
 			}
 		}
 		else
@@ -639,12 +654,25 @@ class Lua
 		}
 	}
 
-	// Reads N arguments from Lua stack positions 1..N into a typed tuple.
-	// Used by expose_func to populate arguments before calling the wrapped function.
-	template <typename... Args, std::size_t... Is>
-	static std::tuple<Args...> collect_args([[maybe_unused]] lua_State* L, std::index_sequence<Is...>)
+	// Decays array types (e.g. const char[N] from string literals) to pointers
+	// before they reach push(). Other types are forwarded unchanged.
+	// Needed because const T& and T&& bind without array-to-pointer decay.
+	template <typename T>
+	static decltype(auto) decay_for_push(T&& value)
 	{
-		return {read<Args>(L, static_cast<int>(Is) + 1)...};
+		if constexpr(std::is_array_v<std::remove_reference_t<T>>)
+			return static_cast<std::decay_t<std::remove_reference_t<T>>>(std::forward<T>(value));
+		else
+			return std::forward<T>(value);
+	}
+
+	// Reads N typed arguments from the Lua stack starting at position `base`.
+	// expose_func passes base=1 (args at 1..N).
+	// expose_method / expose_mutable_method pass base=2 (self at 1, args at 2..N+1).
+	template <typename... Args, std::size_t... Is>
+	static std::tuple<Args...> collect_args_from([[maybe_unused]] lua_State* L, int base, std::index_sequence<Is...>)
+	{
+		return {read<Args>(L, base + static_cast<int>(Is))...};
 	}
 
 	// Pushes each element of a tuple onto the Lua stack in order.
@@ -811,13 +839,5 @@ class Lua
 		}
 		// metatable at -1, struct table at -2
 		lua_setmetatable(L, -2); // consumes the metatable
-	}
-
-	// Reads method arguments from Lua stack positions 2 .. N+1 into a typed
-	// tuple. Position 1 is always self (the struct instance).
-	template <typename... Args, std::size_t... Is>
-	static std::tuple<Args...> collect_method_args([[maybe_unused]] lua_State* L, std::index_sequence<Is...>)
-	{
-		return {read<Args>(L, static_cast<int>(Is) + 2)...};
 	}
 };

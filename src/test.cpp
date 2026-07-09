@@ -1926,3 +1926,73 @@ TEST_CASE("Lua builds vector<Config> via factory", "[construction][expose_func][
 	REQUIRE(cfgs[2].port == 50051);
 	REQUIRE(cfgs[2].tags == std::vector<std::string>{"grpc"});
 }
+
+TEST_CASE("run_script: non-string Lua error produces non-empty message", "[run_script]")
+{
+	Lua lua;
+	auto [ok, err] = lua.run_script("error({})");
+	REQUIRE(!ok);
+	REQUIRE(!err.empty());
+}
+
+TEST_CASE("call: non-string Lua error produces non-empty message", "[call]")
+{
+	Lua lua;
+	lua.run_script("function bad() error({}) end");
+	auto [ok, err] = lua.call<>("bad");
+	REQUIRE(!ok);
+	REQUIRE(!err.empty());
+}
+
+TEST_CASE("run_script: scripts that return values run successfully", "[run_script]")
+{
+	Lua lua;
+	lua.run_script("function add(a, b) return a + b end");
+
+	for(int i = 0; i < 500; ++i)
+	{
+		auto [ok, err] = lua.run_script("return 1, 2, 3, 4, 5");
+		REQUIRE(ok);
+	}
+
+	auto [ok, err, result] = lua.call<int>("add", 11, 22);
+	REQUIRE(ok);
+	REQUIRE(result == 33);
+}
+
+TEST_CASE("assign: string literal is accepted", "[assign]")
+{
+	Lua lua;
+	lua.assign("s", "literal");
+	auto [ok, err] = lua.run_script("assert(s == 'literal')");
+	REQUIRE(ok);
+}
+
+TEST_CASE("call: string literal passed as arg", "[call]")
+{
+	Lua lua;
+	lua.run_script("function echo(s) return s end");
+	auto [ok, err, result] = lua.call<std::string>("echo", "hello");
+	REQUIRE(ok);
+	REQUIRE(result == "hello");
+}
+
+TEST_CASE("assign: std::string preserves embedded null bytes", "[assign][string]")
+{
+	Lua lua;
+	const std::string s("hello\0world", 11);
+	lua.assign("s", s);
+	auto [ok, err] = lua.run_script("assert(#s == 11)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("call: std::string with embedded null bytes round-trips", "[call][string]")
+{
+	Lua lua;
+	lua.run_script("function id(x) return x end");
+	const std::string s("ab\0cd", 5);
+	auto [ok, err, result] = lua.call<std::string>("id", s);
+	REQUIRE(ok);
+	REQUIRE(result.size() == 5);
+	REQUIRE(result == s);
+}
