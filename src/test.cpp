@@ -1782,3 +1782,147 @@ TEST_CASE("expose_mutable_method: Registry::erase removes from map field in plac
 	auto [ok, err] = lua.run_script("assert(reg.entries.x == nil and reg.entries.y == 2)");
 	REQUIRE(ok);
 }
+
+// ============================================================
+// Complex type construction from Lua
+//
+// Config has four field types: std::string, int,
+// std::vector<std::string>, and std::map<std::string,int>.
+// These tests show three ways Lua can create and return a
+// fully-populated instance to C++.
+// ============================================================
+
+struct Config
+{
+	std::string name;
+	int port;
+	std::vector<std::string> tags;
+	std::map<std::string, int> settings;
+};
+LUA_REGISTER_STRUCT(Config,
+                    lua_field("name", &Config::name),
+                    lua_field("port", &Config::port),
+                    lua_field("tags", &Config::tags),
+                    lua_field("settings", &Config::settings))
+
+// ------------------------------------------------------------
+// 1. Pure table literal — no factory, no exposed methods.
+//    Lua constructs the entire instance from Lua-side literals.
+// ------------------------------------------------------------
+TEST_CASE("Lua constructs Config from pure table literal", "[construction][struct]")
+{
+	Lua lua;
+
+	lua.run_script(R"(
+		function make_config()
+			return {
+				name     = "server",
+				port     = 8080,
+				tags     = {"http", "v2"},
+				settings = {timeout = 30, retries = 3}
+			}
+		end
+	)");
+
+	auto [ok, err, cfg] = lua.call<Config>("make_config");
+	REQUIRE(ok);
+	REQUIRE(cfg.name == "server");
+	REQUIRE(cfg.port == 8080);
+	REQUIRE(cfg.tags == std::vector<std::string>{"http", "v2"});
+	REQUIRE(cfg.settings.at("timeout") == 30);
+	REQUIRE(cfg.settings.at("retries") == 3);
+}
+
+// ------------------------------------------------------------
+// 2. Factory + mutable builder.
+//    C++ exposes a constructor and two mutating methods.
+//    Lua calls the factory, calls the methods to populate
+//    the instance, then returns the completed object.
+// ------------------------------------------------------------
+TEST_CASE("Lua constructs Config via factory and mutable builder",
+          "[construction][expose_func][expose_mutable_method][struct]")
+{
+	Lua lua;
+
+	// Factory: create a Config with name + port; tags and settings empty.
+	lua.expose_func<Config>("new_config",
+	                        std::function<Config(std::string, int)>([](std::string name, int port)
+	                                                                { return Config{std::move(name), port, {}, {}}; }));
+
+	// Builder: append one tag.
+	lua.expose_mutable_method<Config>("add_tag", std::function<void(Config&, std::string)>(
+	                                             [](Config& c, std::string tag) { c.tags.push_back(std::move(tag)); }));
+
+	// Builder: insert / overwrite one settings entry.
+	lua.expose_mutable_method<Config>("set", std::function<void(Config&, std::string, int)>(
+	                                         [](Config& c, std::string k, int v) { c.settings[std::move(k)] = v; }));
+
+	// Lua creates the instance entirely on its own side.
+	lua.run_script(R"(
+		function build_config()
+			local cfg = new_config("server", 8080)
+			cfg:add_tag("http")
+			cfg:add_tag("v2")
+			cfg:set("timeout", 30)
+			cfg:set("retries", 3)
+			return cfg
+		end
+	)");
+
+	auto [ok, err, cfg] = lua.call<Config>("build_config");
+	REQUIRE(ok);
+	REQUIRE(cfg.name == "server");
+	REQUIRE(cfg.port == 8080);
+	REQUIRE(cfg.tags == std::vector<std::string>{"http", "v2"});
+	REQUIRE(cfg.settings.at("timeout") == 30);
+	REQUIRE(cfg.settings.at("retries") == 3);
+}
+
+// ------------------------------------------------------------
+// 3. Factory-built collection.
+//    Lua calls the factory in a loop and returns a
+//    vector<Config> — each element fully created in Lua.
+// ------------------------------------------------------------
+TEST_CASE("Lua builds vector<Config> via factory", "[construction][expose_func][struct][vector]")
+{
+	Lua lua;
+
+	lua.expose_func<Config>("new_config",
+	                        std::function<Config(std::string, int)>([](std::string name, int port)
+	                                                                { return Config{std::move(name), port, {}, {}}; }));
+
+	lua.expose_mutable_method<Config>("add_tag", std::function<void(Config&, std::string)>(
+	                                             [](Config& c, std::string tag) { c.tags.push_back(std::move(tag)); }));
+
+	lua.run_script(R"(
+		function make_services()
+			local api = new_config("api",  9000)
+			api:add_tag("rest")
+
+			local web = new_config("web",  8080)
+			web:add_tag("http")
+			web:add_tag("https")
+
+			local rpc = new_config("grpc", 50051)
+			rpc:add_tag("grpc")
+
+			return {api, web, rpc}
+		end
+	)");
+
+	auto [ok, err, cfgs] = lua.call<std::vector<Config>>("make_services");
+	REQUIRE(ok);
+	REQUIRE(cfgs.size() == 3);
+
+	REQUIRE(cfgs[0].name == "api");
+	REQUIRE(cfgs[0].port == 9000);
+	REQUIRE(cfgs[0].tags == std::vector<std::string>{"rest"});
+
+	REQUIRE(cfgs[1].name == "web");
+	REQUIRE(cfgs[1].port == 8080);
+	REQUIRE(cfgs[1].tags == std::vector<std::string>{"http", "https"});
+
+	REQUIRE(cfgs[2].name == "grpc");
+	REQUIRE(cfgs[2].port == 50051);
+	REQUIRE(cfgs[2].tags == std::vector<std::string>{"grpc"});
+}
