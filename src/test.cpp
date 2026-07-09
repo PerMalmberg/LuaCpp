@@ -78,7 +78,7 @@ TEST_CASE("assign: const char* is visible in Lua", "[assign]")
 }
 
 // ============================================================
-// call – success cases
+// call - success cases
 // ============================================================
 
 TEST_CASE("call: no args, no return values", "[call]")
@@ -197,7 +197,7 @@ TEST_CASE("call: uses assign'd global", "[call][assign]")
 }
 
 // ============================================================
-// call – error cases
+// call - error cases
 // ============================================================
 
 TEST_CASE("call error: undefined global is not a function", "[call]")
@@ -321,7 +321,7 @@ TEST_CASE("stack hygiene: successful call after type-check failure", "[stack]")
 	REQUIRE(result == 7);
 }
 // ============================================================
-// expose_func – success cases
+// expose_func - success cases
 // ============================================================
 
 TEST_CASE("expose_func: void return, no args, side effect in C++", "[expose_func]")
@@ -433,7 +433,7 @@ TEST_CASE("expose_func: usable inside a Lua function", "[expose_func]")
 }
 
 // ============================================================
-// expose_func – error cases
+// expose_func - error cases
 // ============================================================
 
 TEST_CASE("expose_func error: too few arguments", "[expose_func]")
@@ -470,7 +470,7 @@ TEST_CASE("expose_func error: wrong argument type", "[expose_func]")
 }
 
 // ============================================================
-// expose_func – stack hygiene
+// expose_func - stack hygiene
 // ============================================================
 
 TEST_CASE("expose_func stack hygiene: callable multiple times without stack leak", "[expose_func][stack]")
@@ -742,4 +742,176 @@ TEST_CASE("map error: non-table returned where map expected", "[map]")
 	auto [ok, err, result] = lua.call<std::map<std::string, int>>("f");
 	REQUIRE_FALSE(ok);
 	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected table"));
+}
+
+// ============================================================
+// expose_method - struct methods
+// ============================================================
+
+TEST_CASE("expose_method: void return, no extra args", "[expose_method]")
+{
+	Lua lua;
+	int call_count = 0;
+	lua.expose_method<Point>("touch", std::function<void(Point)>([&call_count](Point) { ++call_count; }));
+	lua.assign("p", Point{1, 2});
+	lua.run_script("p:touch()");
+	REQUIRE(call_count == 1);
+	lua.run_script("p:touch(); p:touch()");
+	REQUIRE(call_count == 3);
+}
+
+TEST_CASE("expose_method: scalar return, no extra args", "[expose_method]")
+{
+	Lua lua;
+	lua.expose_method<Point, int>("magnitude_sq",
+	                              std::function<int(Point)>([](Point p) { return p.x * p.x + p.y * p.y; }));
+	lua.assign("p", Point{3, 4});
+	auto [ok, err] = lua.run_script("assert(p:magnitude_sq() == 25)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("expose_method: scalar return, with extra args", "[expose_method]")
+{
+	Lua lua;
+	lua.expose_method<Point, int>("dot", std::function<int(Point, Point)>([](Point a, Point b)
+	                                                                      { return a.x * b.x + a.y * b.y; }));
+	lua.assign("p", Point{3, 4});
+	lua.assign("q", Point{1, 2});
+	auto [ok, err] = lua.run_script("assert(p:dot(q) == 11)");
+	REQUIRE(ok);
+}
+
+TEST_CASE("expose_method: struct return via Lua wrapper", "[expose_method]")
+{
+	Lua lua;
+	lua.expose_method<Point, Point>("translate", std::function<Point(Point, int, int)>(
+	                                             [](Point p, int dx, int dy) { return Point{p.x + dx, p.y + dy}; }));
+	lua.assign("p", Point{1, 2});
+	lua.run_script("function get_moved() return p:translate(10, 20) end");
+	auto [ok, err, result] = lua.call<Point>("get_moved");
+	REQUIRE(ok);
+	REQUIRE(result.x == 11);
+	REQUIRE(result.y == 22);
+}
+
+TEST_CASE("expose_method: multiple return values", "[expose_method]")
+{
+	Lua lua;
+	lua.expose_method<Point, int, int>("components", std::function<std::tuple<int, int>(Point)>(
+	                                                 [](Point p) { return std::make_tuple(p.x, p.y); }));
+	lua.assign("p", Point{7, 13});
+	lua.run_script("function get_comps() return p:components() end");
+	auto [ok, err, x, y] = lua.call<int, int>("get_comps");
+	REQUIRE(ok);
+	REQUIRE(x == 7);
+	REQUIRE(y == 13);
+}
+
+TEST_CASE("expose_method: two methods on same type work independently", "[expose_method]")
+{
+	Lua lua;
+	lua.expose_method<Point, int>("sum_xy", std::function<int(Point)>([](Point p) { return p.x + p.y; }));
+	lua.expose_method<Point, int>("diff_xy", std::function<int(Point)>([](Point p) { return p.x - p.y; }));
+	lua.assign("p", Point{10, 3});
+	auto [ok1, err1] = lua.run_script("assert(p:sum_xy() == 13)");
+	auto [ok2, err2] = lua.run_script("assert(p:diff_xy() == 7)");
+	REQUIRE(ok1);
+	REQUIRE(ok2);
+}
+
+TEST_CASE("expose_method: method on nested struct field", "[expose_method]")
+{
+	Lua lua;
+	lua.expose_method<Point, int>("magnitude_sq",
+	                              std::function<int(Point)>([](Point p) { return p.x * p.x + p.y * p.y; }));
+	lua.assign("r", Rect{Point{3, 4}, 10, 20});
+	auto [ok, err] = lua.run_script("assert(r.origin:magnitude_sq() == 25)");
+	REQUIRE(ok);
+}
+
+// expose_method - error cases
+
+TEST_CASE("expose_method error: too many arguments", "[expose_method]")
+{
+	Lua lua;
+	lua.expose_method<Point, int>("magnitude_sq",
+	                              std::function<int(Point)>([](Point p) { return p.x * p.x + p.y * p.y; }));
+	lua.assign("p", Point{3, 4});
+	auto [ok, err] = lua.run_script("p:magnitude_sq(99)"); // one extra arg beyond self
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected 0"));
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("got 1"));
+}
+
+TEST_CASE("expose_method error: too few arguments", "[expose_method]")
+{
+	Lua lua;
+	lua.expose_method<Point, int>("dot", std::function<int(Point, Point)>([](Point a, Point b)
+	                                                                      { return a.x * b.x + a.y * b.y; }));
+	lua.assign("p", Point{3, 4});
+	auto [ok, err] = lua.run_script("p:dot()"); // missing the second Point arg
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected 1"));
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("got 0"));
+}
+
+TEST_CASE("expose_method error: wrong argument type", "[expose_method]")
+{
+	Lua lua;
+	lua.expose_method<Point, int>("add_x", std::function<int(Point, int)>([](Point p, int n) { return p.x + n; }));
+	lua.assign("p", Point{1, 2});
+	auto [ok, err] = lua.run_script("p:add_x('bad')"); // string instead of integer
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected integer"));
+}
+
+// expose_method - stack hygiene
+
+TEST_CASE("expose_method stack hygiene: callable multiple times without leak", "[expose_method][stack]")
+{
+	Lua lua;
+	lua.expose_method<Point, int>("magnitude_sq",
+	                              std::function<int(Point)>([](Point p) { return p.x * p.x + p.y * p.y; }));
+	lua.assign("p", Point{3, 4});
+	for(int i = 0; i < 10; ++i)
+	{
+		auto [ok, err] = lua.run_script("assert(p:magnitude_sq() == 25)");
+		REQUIRE(ok);
+	}
+}
+
+TEST_CASE("expose_method: data modified alternately by C++ and Lua", "[expose_method]")
+{
+	Lua lua;
+
+	lua.expose_method<Point, Point>("shift", std::function<Point(Point, int, int)>(
+	                                         [](Point p, int dx, int dy) { return Point{p.x + dx, p.y + dy}; }));
+
+	lua.expose_method<Point, Point>("scale", std::function<Point(Point, int)>(
+	                                         [](Point p, int factor) { return Point{p.x * factor, p.y * factor}; }));
+
+	// Lua orchestrates a chain of two method calls, each dispatching into C++.
+	lua.run_script(R"(
+		function lua_process(p)
+			return p:shift(1, 1):scale(2)
+		end
+	)");
+
+	// Step 1 - C++ owns the initial value.
+	const Point origin{3, 4};
+
+	// Step 2 - C++ hands it to Lua; Lua applies :shift then :scale via method calls.
+	auto [ok1, err1, p1] = lua.call<Point>("lua_process", origin);
+	REQUIRE(ok1);
+	REQUIRE(p1.x == 8); // (3+1)*2
+	REQUIRE(p1.y == 10); // (4+1)*2
+
+	// Step 3 - C++ modifies the returned value (subtracts the original coordinates).
+	const Point p2{p1.x - origin.x, p1.y - origin.y}; // {8-3, 10-4} = {5, 6}
+
+	// Step 4 - C++ passes the modified value back to Lua for another round.
+	auto [ok2, err2, p3] = lua.call<Point>("lua_process", p2);
+	REQUIRE(ok2);
+	REQUIRE(p3.x == 12); // (5+1)*2
+	REQUIRE(p3.y == 14); // (6+1)*2
 }

@@ -241,37 +241,73 @@ class Lua
 		registered_funcs.push_back(std::move(wrapper));
 		LuaFunc* fn_ptr = registered_funcs.back().get();
 
-		// Trampoline: the actual lua_CFunction stored with Lua. Non-capturing so
-		// it converts to a plain f pointer. Catches C++ exceptions and
-		// re-raises them as Lua er; lua_error (longjmp) is called only after
-		// all C++ objects on this frame are destroyed, avoiding UB.
 		lua_pushlightuserdata(*this, fn_ptr);
-		lua_pushcclosure(
-		*this,
-		[](lua_State* L) -> int
-		{
-			auto* fn = static_cast<LuaFunc*>(lua_touserdata(L, lua_upvalueindex(1)));
-			bool has_error = false;
-			int nret = 0;
-			try
-			{
-				nret = (*fn)(L);
-			}
-			catch(const std::exception& e)
-			{
-				lua_pushstring(L,
-				               e.what()); // copy message into Lua before unwinding
-				has_error = true;
-			}
-			// All C++ objects are destroyed here; safe to longjmp.
-			if(has_error)
-			{
-				return lua_error(L);
-			}
-			return nret;
-		},
-		1);
+		lua_pushcclosure(*this, &Lua::trampoline, 1);
 		lua_setglobal(*this, name);
+	}
+
+	// Registers a C++ callable as a named method on all Lua instances of StructType.
+	//
+	// After registration every StructType value pushed to Lua (via assign, call<>,
+	// or an expose_func return value) carries a shared metatable whose __index
+	// table contains this method, enabling colon-call syntax from Lua:
+	//   obj:name(extra_args...)
+	//
+	// StructType is always the first explicit template argument.
+	// ReturnTypes follow the same convention as expose_func<>:
+	//   omit for void, one type for a scalar return, multiple for a tuple.
+	// The C++ function receives self (the struct) as its first argument by value;
+	// any additional arguments follow in order.
+	//
+	// Example - no extra args:
+	//   lua.expose_method<Point, int>("magnitude_sq",
+	//       std::function<int(Point)>([](Point p){ return p.x*p.x + p.y*p.y; }));
+	//
+	// Example - extra args:
+	//   lua.expose_method<Point, Point>("translate",
+	//       std::function<Point(Point, int, int)>(
+	//           [](Point p, int dx, int dy){ return Point{p.x+dx, p.y+dy}; }));
+	template <typename StructType, typename... ReturnTypes, typename... Args>
+	void expose_method(const char* name, std::function<lua_return_t<ReturnTypes...>(StructType, Args...)> func)
+	{
+		static_assert(has_lua_fields<StructType>::value,
+		              "expose_method: StructType must be registered with LUA_REGISTER_STRUCT");
+
+		auto wrapper = std::make_unique<LuaFunc>(
+		[func = std::move(func)](lua_State* L) -> int
+		{
+			constexpr int n_method_args = static_cast<int>(sizeof...(Args));
+			constexpr int expected = n_method_args + 1; // +1 for implicit self
+			if(const int got = lua_gettop(L); got != expected)
+				throw std::runtime_error("expected " + std::to_string(n_method_args) + " argument(s), got " +
+				                         std::to_string(got - 1));
+
+			auto self = read<StructType>(L, 1);
+			auto args = collect_method_args<Args...>(L, std::index_sequence_for<Args...>{});
+			auto all_args = std::tuple_cat(std::make_tuple(std::move(self)), std::move(args));
+
+			if constexpr(sizeof...(ReturnTypes) == 0)
+			{
+				std::apply(func, std::move(all_args));
+				return 0;
+			}
+			else if constexpr(sizeof...(ReturnTypes) == 1)
+			{
+				push(L, std::apply(func, std::move(all_args)));
+				return 1;
+			}
+			else
+			{
+				auto results = std::apply(func, std::move(all_args));
+				push_results(L, results, std::index_sequence_for<ReturnTypes...>{});
+				return static_cast<int>(sizeof...(ReturnTypes));
+			}
+		});
+
+		registered_funcs.push_back(std::move(wrapper));
+		LuaFunc* fn_ptr = registered_funcs.back().get();
+
+		add_method_to_registry<StructType>(*this, name, fn_ptr);
 	}
 
   private:
@@ -419,6 +455,7 @@ class Lua
 		{
 			lua_newtable(L);
 			std::apply([&](const auto&... fields) { (push_struct_field(L, value, fields), ...); }, LuaFields<T>::value);
+			attach_methods_if_any<T>(L);
 		}
 		else if constexpr(is_std_vector<T>::value)
 		{
@@ -487,5 +524,103 @@ class Lua
 		lua_getfield(L, idx, f.name); // pushes field value; idx still refers to the table
 		s.*f.ptr = read<Member>(L, -1);
 		lua_pop(L, 1);
+	}
+
+	// ---------------------------------------------------------------------------
+	// Struct method dispatch
+	// ---------------------------------------------------------------------------
+
+	// Non-capturing lua_CFunction used as the trampoline for both expose_func and
+	// expose_method closures. Reads a LuaFunc* from upvalue slot 1, invokes it,
+	// and converts any C++ exception into a Lua error after all C++ objects on
+	// this frame are destroyed (safe for Lua's longjmp-based error protocol).
+	static int trampoline(lua_State* L)
+	{
+		auto* fn = static_cast<LuaFunc*>(lua_touserdata(L, lua_upvalueindex(1)));
+		bool has_error = false;
+		int nret = 0;
+		try
+		{
+			nret = (*fn)(L);
+		}
+		catch(const std::exception& e)
+		{
+			lua_pushstring(L, e.what()); // copy message into Lua before unwinding
+			has_error = true;
+		}
+		// All C++ objects are destroyed here; safe to longjmp.
+		if(has_error)
+		{
+			return lua_error(L);
+		}
+		return nret;
+	}
+
+	// Returns a unique void* identifying type T in the Lua registry.
+	// The address of the function-local static is stable for the process lifetime
+	// and unique per template instantiation.
+	template <typename T>
+	static const void* get_type_key()
+	{
+		static const char sentinel = 0;
+		return &sentinel;
+	}
+
+	// Looks up (or creates) the per-type metatable for T in the Lua registry and
+	// adds a trampoline closure for fn_ptr to its __index sub-table under `name`.
+	// Leaves the Lua stack balanced.
+	template <typename T>
+	static void add_method_to_registry(lua_State* L, const char* name, LuaFunc* fn_ptr)
+	{
+		lua_pushlightuserdata(L, const_cast<void*>(get_type_key<T>()));
+		lua_rawget(L, LUA_REGISTRYINDEX); // push metatable or nil
+
+		if(lua_isnil(L, -1))
+		{
+			lua_pop(L, 1);
+
+			lua_newtable(L);                      // metatable
+			lua_newtable(L);                      // __index table
+			lua_setfield(L, -2, "__index");       // metatable.__index = {}
+
+			lua_pushlightuserdata(L, const_cast<void*>(get_type_key<T>()));
+			lua_pushvalue(L, -2);                 // duplicate metatable
+			lua_rawset(L, LUA_REGISTRYINDEX);     // registry[type_key] = metatable
+			// stack: [metatable]
+		}
+		// stack: [metatable]
+
+		lua_getfield(L, -1, "__index");           // stack: [metatable, __index_table]
+
+		lua_pushlightuserdata(L, fn_ptr);
+		lua_pushcclosure(L, &Lua::trampoline, 1); // stack: [metatable, __index_table, closure]
+		lua_setfield(L, -2, name);                // __index_table[name] = closure
+
+		lua_pop(L, 2);                            // pop __index_table and metatable
+	}
+
+	// Attaches T's method metatable (if any) to the table currently on top of the
+	// stack. Looks up the Lua registry; no-op when no methods have been registered
+	// for T.
+	template <typename T>
+	static void attach_methods_if_any(lua_State* L)
+	{
+		lua_pushlightuserdata(L, const_cast<void*>(get_type_key<T>()));
+		lua_rawget(L, LUA_REGISTRYINDEX); // push metatable or nil
+		if(lua_isnil(L, -1))
+		{
+			lua_pop(L, 1);
+			return;
+		}
+		// metatable at -1, struct table at -2
+		lua_setmetatable(L, -2); // consumes the metatable
+	}
+
+	// Reads method arguments from Lua stack positions 2 .. N+1 into a typed
+	// tuple. Position 1 is always self (the struct instance).
+	template <typename... Args, std::size_t... Is>
+	static std::tuple<Args...> collect_method_args([[maybe_unused]] lua_State* L, std::index_sequence<Is...>)
+	{
+		return {read<Args>(L, static_cast<int>(Is) + 2)...};
 	}
 };
