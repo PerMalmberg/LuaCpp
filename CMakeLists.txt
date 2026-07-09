@@ -89,6 +89,17 @@ else()
   target_compile_options(tests PRIVATE -O2 -Wall -Wextra -Werror)
 endif()
 
+# ---------------------------------------------------------------------------
+# AddressSanitizer (ASAN)
+# ---------------------------------------------------------------------------
+option(ENABLE_ASAN "Enable AddressSanitizer for the tests target" ON)
+
+if(ENABLE_ASAN AND NOT MSVC)
+  target_compile_options(tests PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+  target_link_options(tests PRIVATE -fsanitize=address)
+  message(STATUS "ASAN enabled for 'tests'")
+endif()
+
 enable_testing()
 catch_discover_tests(tests)
 

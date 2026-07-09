@@ -238,12 +238,12 @@ class Lua
 
 		// Transfer ownership before touching the Lua stack so that an allocation
 		// failure leaves Lua's state untouched.
-		registered_funcs_.push_back(std::move(wrapper));
-		LuaFunc* fn_ptr = registered_funcs_.back().get();
+		registered_funcs.push_back(std::move(wrapper));
+		LuaFunc* fn_ptr = registered_funcs.back().get();
 
 		// Trampoline: the actual lua_CFunction stored with Lua. Non-capturing so
-		// it converts to a plain function pointer. Catches C++ exceptions and
-		// re-raises them as Lua errors; lua_error (longjmp) is called only after
+		// it converts to a plain f pointer. Catches C++ exceptions and
+		// re-raises them as Lua er; lua_error (longjmp) is called only after
 		// all C++ objects on this frame are destroyed, avoiding UB.
 		lua_pushlightuserdata(*this, fn_ptr);
 		lua_pushcclosure(
@@ -299,7 +299,7 @@ class Lua
 	// Owns the typed wrapper objects whose raw pointers are stored as Lua
 	// upvalues. Declared before state so it is destroyed after lua_close(),
 	// ensuring no dangling LuaFunc* pointers exist while the state is live.
-	std::vector<std::unique_ptr<LuaFunc>> registered_funcs_;
+	std::vector<std::unique_ptr<LuaFunc>> registered_funcs;
 
 	LuaStatePtr state{luaL_newstate(), [](lua_State* L) { lua_close(L); }};
 
