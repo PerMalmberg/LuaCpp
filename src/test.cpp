@@ -1998,6 +1998,94 @@ TEST_CASE("call: std::string with embedded null bytes round-trips", "[call][stri
 }
 
 // ============================================================
+// Mixed-type struct
+//
+// Device combines every supported field kind in a single struct:
+//   int, float, bool, std::string, nested struct (Point),
+//   std::vector<std::string>, std::map<std::string, int>.
+// ============================================================
+
+struct Device
+{
+	std::string id;
+	int channel;
+	float threshold;
+	bool active;
+	Point position;
+	std::vector<std::string> labels;
+	std::map<std::string, int> counters;
+};
+LUA_REGISTER_STRUCT(Device,
+                    lua_field("id", &Device::id),
+                    lua_field("channel", &Device::channel),
+                    lua_field("threshold", &Device::threshold),
+                    lua_field("active", &Device::active),
+                    lua_field("position", &Device::position),
+                    lua_field("labels", &Device::labels),
+                    lua_field("counters", &Device::counters))
+
+TEST_CASE("mixed-type struct: round-trip through Lua preserves all fields", "[struct][mixed]")
+{
+	Lua lua;
+
+	// Lua receives the struct as a table, reads two fields, returns it unchanged.
+	lua.run_script(R"(
+		function identity(d)
+			assert(d.id        == "sensor-1")
+			assert(d.channel   == 3)
+			assert(d.active    == true)
+			return d
+		end
+	)");
+
+	Device
+	input{"sensor-1", 3, 0.75f, true, Point{10, 20}, {"temperature", "humidity"}, {{"reads", 42}, {"errors", 1}}};
+
+	auto [ok, err, d] = lua.call<Device>("identity", input);
+	REQUIRE(ok);
+	REQUIRE(d.id == "sensor-1");
+	REQUIRE(d.channel == 3);
+	REQUIRE(d.threshold == Catch::Approx(0.75f));
+	REQUIRE(d.active == true);
+	REQUIRE(d.position.x == 10);
+	REQUIRE(d.position.y == 20);
+	REQUIRE(d.labels == std::vector<std::string>{"temperature", "humidity"});
+	REQUIRE(d.counters.at("reads") == 42);
+	REQUIRE(d.counters.at("errors") == 1);
+}
+
+TEST_CASE("mixed-type struct: constructed entirely in Lua", "[struct][mixed][construction]")
+{
+	Lua lua;
+
+	lua.run_script(R"(
+		function make_device()
+			return {
+				id        = "actuator-7",
+				channel   = 12,
+				threshold = 1.5,
+				active    = false,
+				position  = {x = 5, y = -3},
+				labels    = {"motor", "pwm", "output"},
+				counters  = {writes = 100, overflows = 0}
+			}
+		end
+	)");
+
+	auto [ok, err, d] = lua.call<Device>("make_device");
+	REQUIRE(ok);
+	REQUIRE(d.id == "actuator-7");
+	REQUIRE(d.channel == 12);
+	REQUIRE(d.threshold == Catch::Approx(1.5f));
+	REQUIRE(d.active == false);
+	REQUIRE(d.position.x == 5);
+	REQUIRE(d.position.y == -3);
+	REQUIRE(d.labels == std::vector<std::string>{"motor", "pwm", "output"});
+	REQUIRE(d.counters.at("writes") == 100);
+	REQUIRE(d.counters.at("overflows") == 0);
+}
+
+// ============================================================
 // Deeply nested tables and arrays (5 levels)
 // ============================================================
 
