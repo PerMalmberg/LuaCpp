@@ -6,6 +6,7 @@ extern "C"
 }
 
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -481,7 +482,10 @@ class Lua final
 	// Owns the typed wrapper objects whose raw pointers are stored as Lua
 	// upvalues. Declared before state so it is destroyed after lua_close(),
 	// ensuring no dangling LuaFunc* pointers exist while the state is live.
-	std::vector<std::unique_ptr<LuaFunc>> registered_funcs;
+	// std::list is used instead of std::vector so that push_back never
+	// reallocates: the raw fn_ptr stored as a Lua upvalue must remain stable
+	// for the lifetime of the Lua state.
+	std::list<std::unique_ptr<LuaFunc>> registered_funcs;
 
 	LuaStatePtr state{luaL_newstate(), [](lua_State* L) { lua_close(L); }};
 
