@@ -1996,3 +1996,190 @@ TEST_CASE("call: std::string with embedded null bytes round-trips", "[call][stri
 	REQUIRE(result.size() == 5);
 	REQUIRE(result == s);
 }
+
+// ============================================================
+// Deeply nested tables and arrays (5 levels)
+// ============================================================
+
+// --- nested structs (5 levels deep) ---
+
+struct L5
+{
+	int value;
+};
+LUA_REGISTER_STRUCT(L5, lua_field("value", &L5::value))
+
+struct L4
+{
+	L5 inner;
+};
+LUA_REGISTER_STRUCT(L4, lua_field("inner", &L4::inner))
+
+struct L3
+{
+	L4 inner;
+};
+LUA_REGISTER_STRUCT(L3, lua_field("inner", &L3::inner))
+
+struct L2
+{
+	L3 inner;
+};
+LUA_REGISTER_STRUCT(L2, lua_field("inner", &L2::inner))
+
+struct L1
+{
+	L2 inner;
+};
+LUA_REGISTER_STRUCT(L1, lua_field("inner", &L1::inner))
+
+TEST_CASE("Lua returns 5-deep nested struct", "[nested][struct]")
+{
+	Lua lua;
+
+	lua.run_script(R"(
+		function make_deep()
+			return {
+				inner = {
+					inner = {
+						inner = {
+							inner = {
+								value = 42
+							}
+						}
+					}
+				}
+			}
+		end
+	)");
+
+	auto [ok, err, result] = lua.call<L1>("make_deep");
+	REQUIRE(ok);
+	REQUIRE(result.inner.inner.inner.inner.value == 42);
+}
+
+// --- 5-deep nested vector (vector<vector<vector<vector<vector<int>>>>>) ---
+
+TEST_CASE("Lua returns 5-deep nested array", "[nested][vector]")
+{
+	Lua lua;
+
+	lua.run_script(R"(
+		function make_deep_array()
+			return { { { { { 1, 2, 3 } } } } }
+		end
+	)");
+
+	using V5 = std::vector<int>;
+	using V4 = std::vector<V5>;
+	using V3 = std::vector<V4>;
+	using V2 = std::vector<V3>;
+	using V1 = std::vector<V2>;
+
+	auto [ok, err, result] = lua.call<V1>("make_deep_array");
+	REQUIRE(ok);
+	REQUIRE(result.size() == 1);
+	REQUIRE(result[0].size() == 1);
+	REQUIRE(result[0][0].size() == 1);
+	REQUIRE(result[0][0][0].size() == 1);
+	REQUIRE(result[0][0][0][0] == std::vector<int>{1, 2, 3});
+}
+
+// --- 5-deep nested map (map<string, map<string, map<string, map<string, map<string, int>>>>>) ---
+
+TEST_CASE("Lua returns 5-deep nested map", "[nested][map]")
+{
+	Lua lua;
+
+	lua.run_script(R"(
+		function make_deep_map()
+			return { a = { b = { c = { d = { e = 99 } } } } }
+		end
+	)");
+
+	using M5 = std::map<std::string, int>;
+	using M4 = std::map<std::string, M5>;
+	using M3 = std::map<std::string, M4>;
+	using M2 = std::map<std::string, M3>;
+	using M1 = std::map<std::string, M2>;
+
+	auto [ok, err, result] = lua.call<M1>("make_deep_map");
+	REQUIRE(ok);
+	REQUIRE(result.at("a").at("b").at("c").at("d").at("e") == 99);
+}
+
+// ============================================================
+// Type mismatch errors: vectors, maps, scalars
+// ============================================================
+
+TEST_CASE("call: vector with wrong element type returns error", "[call][vector][type]")
+{
+	Lua lua;
+	lua.run_script("function get() return {1, 'two', 3} end");
+	auto [ok, err, _1] = lua.call<std::vector<int>>("get");
+	REQUIRE(!ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected integer"));
+}
+
+TEST_CASE("call: vector when table not returned returns error", "[call][vector][type]")
+{
+	Lua lua;
+	lua.run_script("function get() return 42 end");
+	auto [ok, err, _2] = lua.call<std::vector<int>>("get");
+	REQUIRE(!ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected table"));
+}
+
+TEST_CASE("call: map with wrong value type returns error", "[call][map][type]")
+{
+	Lua lua;
+	lua.run_script("function get() return {a = 1, b = 'two'} end");
+	auto [ok, err, _3] = lua.call<std::map<std::string, int>>("get");
+	REQUIRE(!ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected integer"));
+}
+
+TEST_CASE("call: map with wrong key type returns error", "[call][map][type]")
+{
+	Lua lua;
+	lua.run_script("function get() return {[true]=1, [false]=2} end");
+	auto [ok, err, _4] = lua.call<std::map<std::string, int>>("get");
+	REQUIRE(!ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected string"));
+}
+
+TEST_CASE("call: map when table not returned returns error", "[call][map][type]")
+{
+	Lua lua;
+	lua.run_script("function get() return 'not a table' end");
+	auto [ok, err, _5] = lua.call<std::map<std::string, int>>("get");
+	REQUIRE(!ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected table"));
+}
+
+TEST_CASE("call: wrong scalar type returns error", "[call][type]")
+{
+	Lua lua;
+	lua.run_script("function get() return 'hello' end");
+	auto [ok, err, _6] = lua.call<int>("get");
+	REQUIRE(!ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected integer"));
+}
+
+TEST_CASE("call: nested vector with wrong inner element type returns error", "[call][vector][type]")
+{
+	Lua lua;
+	lua.run_script("function get() return {{1, 2}, {3, 'four'}} end");
+	auto [ok, err, _7] = lua.call<std::vector<std::vector<int>>>("get");
+	REQUIRE(!ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected integer"));
+}
+
+TEST_CASE("call: nested map with wrong inner value type returns error", "[call][map][type]")
+{
+	Lua lua;
+	lua.run_script("function get() return {x = {a = 1}, y = {b = 'bad'}} end");
+	auto [ok, err, _8] = lua.call<std::map<std::string, std::map<std::string, int>>>("get");
+	REQUIRE(!ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected integer"));
+}
