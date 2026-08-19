@@ -8,6 +8,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# MSVC defaults to /EHsc (synchronous C++ exceptions only), which Microsoft
+# documents as unsafe to combine with setjmp/longjmp: jumping across frames
+# compiled with /EHsc can corrupt the compiler's table-driven unwind info,
+# especially under optimization. Since Lua (compiled as C++ via the wrapper
+# trick below) uses classic setjmp/longjmp for its error handling
+# (LUA_USE_LONGJMP), replace /EHsc with /EHa - which correctly integrates
+# SEH-style unwinding with longjmp - for every target in this project.
+# Without this, Release builds intermittently crash with
+# STATUS_HEAP_CORRUPTION (0xc0000374) specifically in Lua error-path tests
+# (luaL_error / wrong-arg-type / too-many-or-few-args / stack-hygiene-after-
+# error tests).
+if(MSVC)
+  string(REPLACE "/EHsc" "/EHa" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
+
 # ---------------------------------------------------------------------------
 # Fetch Lua 5.5.0 sources
 # ---------------------------------------------------------------------------
@@ -90,7 +105,7 @@ target_compile_definitions(lua_static PRIVATE LUA_USE_LONGJMP)
 # lua.c (the interactive REPL) is excluded from the build so LUA_USE_READLINE
 # never pulls in libreadline on any platform.
 if(MSVC)
-  target_compile_options(lua_static PRIVATE /O2 /W3)
+  target_compile_options(lua_static PRIVATE $<$<NOT:$<CONFIG:Debug>>:/O2> /W3)
   target_compile_definitions(lua_static PRIVATE _CRT_SECURE_NO_WARNINGS)
 elseif(APPLE)
   # AppleClang doesn't know the GCC-specific -Wmaybe-uninitialized warning;
@@ -115,7 +130,7 @@ endif()
 add_executable(main src/main.cpp)
 target_link_libraries(main PRIVATE lua_static)
 if(MSVC)
-  target_compile_options(main PRIVATE /O2 /W4 /WX)
+  target_compile_options(main PRIVATE $<$<NOT:$<CONFIG:Debug>>:/O2> /W4 /WX /bigobj)
 else()
   target_compile_options(main PRIVATE -O2 -Wall -Wextra -Werror)
 endif()
@@ -135,7 +150,7 @@ include(Catch)
 add_executable(tests src/test.cpp)
 target_link_libraries(tests PRIVATE lua_static Catch2::Catch2WithMain)
 if(MSVC)
-  target_compile_options(tests PRIVATE /O2 /W4 /WX)
+  target_compile_options(tests PRIVATE $<$<NOT:$<CONFIG:Debug>>:/O2> /W4 /WX /bigobj)
 else()
   target_compile_options(tests PRIVATE -O2 -Wall -Wextra -Werror)
 endif()

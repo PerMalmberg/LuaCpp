@@ -52,4 +52,27 @@ the actual fix. Both changes are kept together in the final solution.
 ## Status as of last update
 Linux build + 168/168 ctest passing confirmed locally after the per-file
 wrapper fix. Windows/macOS CI re-run pending confirmation (no local
+
+## Windows local build fix (Debug preset): /O2 vs /RTC1 conflict (D8016)
+Repo root on Windows machine: C:\code\LuaCpp
+CMakePresets.json has debug/release/relwithdebinfo presets (no "default").
+Build commands used: `cmake --preset debug` then `cmake --build --preset debug`;
+tests via `ctest --preset debug --output-on-failure`.
+
+Found & fixed a build-breaking bug (not a test failure): CMakeLists.txt
+unconditionally applied `/O2` to lua_static/main/tests under MSVC. The Debug
+preset's CMAKE_CXX_FLAGS_DEBUG already includes `/RTC1` (runtime checks),
+and MSVC errors with `D8016: '/RTC1' and '/O2' command-line options are
+incompatible` when both are present - this only breaks Debug builds, not
+Release/RelWithDebInfo, since /RTC1 is Debug-only.
+
+Fix: wrap `/O2` in a generator expression so it's skipped for Debug config,
+in all three MSVC branches (lua_static, main, tests):
+  target_compile_options(<tgt> PRIVATE $<$<NOT:$<CONFIG:Debug>>:/O2> /W3...)
+
+After this fix: Windows Debug build succeeds (with a few benign MSVC
+warnings in lcode.c/lgc.c/ltable.c: C4551 missing arg list, C4334 32->64
+bit shift truncation - not errors here). ctest --preset debug: 168/168
+tests passed.
+
 Windows/macOS environment available to verify directly).
