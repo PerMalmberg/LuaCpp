@@ -76,6 +76,7 @@ temporarily fixed by splitting the trampoline into `trampoline_impl()` +
 no live C++ objects/`try`-`catch`.
 
 That split has since been **removed** now that:
+
 1. Lua is compiled as C++ *without* `LUA_USE_LONGJMP`, so `lua_error()`
    propagates via a genuine C++ exception (`throw(lua_longjmp*)` in `ldo.c`)
    instead of `longjmp` - a real C++ throw always unwinds correctly and runs
@@ -97,15 +98,43 @@ calls `__gc` metamethods on all live objects. If any metamethod calls back into
 a C++ `expose_func` closure whose captured objects are already partially
 destroyed (e.g., during a parent object's destructor), UB occurs.
 
-**Plan:** Expose a `close()` method that:
-1. Nils every registered global in the Lua state (`lua_pushnil` +
-   `lua_setglobal` for each name in `registered_funcs`).
-2. Runs a full GC cycle (`lua_gc(L, LUA_GCCOLLECT, 0)`) to flush `__gc`
-   callbacks while C++ objects are still alive.
-3. Marks the instance as closed so the destructor skips redundant work.
+**Status: Implemented.** `Lua::close()`:
 
-Callers in destructors should call `close()` explicitly before their owned
-objects begin teardown.
+1. Nils every global registered via `expose_func` (tracked in a new
+   `registered_global_names` member; `expose_method`/`expose_mutable_method`
+   entries are unaffected since they live in per-type metatables in the Lua
+   registry, not as globals).
+2. Forces a full GC cycle (`lua_gc(L, LUA_GCCOLLECT, 0)`, called twice: the
+   first pass queues newly-unreachable finalizable objects, the second
+   guarantees their `__gc` metamethods actually run before `close()`
+   returns, instead of being deferred to whatever GC activity happens next).
+3. Sets a `closed` flag so a repeated call is a cheap no-op.
+
+Callers embedding a `Lua` instance alongside other members that
+`expose_func`/`expose_method` closures capture by raw pointer/reference
+(rather than via the `std::shared_ptr<Owner>` overloads from item 1) should
+call `lua.close()` as the **first statement** in their own destructor body:
+
+```cpp
+Widget::~Widget()
+{
+    lua.close(); // force finalization while `data` etc. are still alive
+}
+```
+
+This matters because a destructor's *body* always runs before any of its
+member subobjects are destroyed, regardless of declaration order - so an
+explicit `close()` call there is safe no matter how `Widget`'s members are
+ordered, whereas relying on `~Lua()` running implicitly during automatic
+member teardown would only be safe if every member the closures reach into
+happens to be declared after `lua` (fragile, and easy to silently get wrong
+later when someone reorders or adds a member).
+
+See the `[lifetime]`-tagged `close()` tests in `test.cpp`, including one that
+reproduces the exact hazard: a Lua script attaches a registered closure as a
+`__gc` metamethod on a table it then drops, and the test confirms the
+closure only fires (and observes still-valid captured state) once `close()`
+is called, not merely as a side effect of registration or `run_script`.
 
 ---
 
@@ -135,6 +164,7 @@ such a coroutine and executing a registered function is UB.
 accessible to all scripts by default.
 
 **Options:**
+
 - Sandbox: nil out `coroutine` after `luaL_openlibs` if coroutines are not
   needed (one line; already listed in `TODO.md` under sandboxing).
 - If coroutines are required, combine with the `weak_ptr` trampoline from

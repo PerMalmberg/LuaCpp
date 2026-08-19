@@ -139,6 +139,59 @@ class Lua final
 
 	~Lua() = default;
 
+	// Explicit early teardown - see LIFETIME.md item 3 for the full rationale.
+	//
+	// Call this as the FIRST statement in the destructor of any class that
+	// embeds a Lua instance alongside other members that expose_func/
+	// expose_method closures capture by raw pointer/reference (rather than
+	// via the std::shared_ptr<Owner> overloads from item 1). A destructor's
+	// BODY always runs before any of its member subobjects are destroyed,
+	// regardless of declaration order, so calling close() there guarantees
+	// every sibling member is still fully alive when close() forces a GC
+	// cycle - unlike relying on ~Lua() running implicitly during automatic
+	// member teardown, whose safety would otherwise depend on getting every
+	// embedding class's member declaration order exactly right, forever.
+	//
+	// What it does:
+	//   1. Nils every global name registered via expose_func (does NOT
+	//      affect expose_method/expose_mutable_method entries, which live in
+	//      per-type metatables in the Lua registry rather than as globals -
+	//      those remain reachable for the lifetime of the Lua state).
+	//   2. Forces a full GC cycle (LUA_GCCOLLECT) so any Lua-side objects
+	//      with a script-set __gc metamethod that happens to reference a
+	//      registered closure are finalized NOW, while C++ state the
+	//      closures may reach into (via raw captures) is still alive.
+	//   3. Marks the instance closed; safe to call multiple times (a second
+	//      call is a cheap no-op).
+	//
+	// Calling close() does not prevent later use of this Lua instance - it
+	// only removes the specific globals that were registered so far and
+	// runs one GC pass. run_script/call/assign/expose_* remain usable
+	// afterward if desired.
+	void close()
+	{
+		if(closed)
+			return;
+
+		for(const auto& name : registered_global_names)
+		{
+			lua_pushnil(*this);
+			lua_setglobal(*this, name.c_str());
+		}
+
+		// A single LUA_GCCOLLECT queues newly-unreachable objects with a
+		// __gc metamethod for finalization and also runs any finalizers
+		// already queued from a previous cycle. Running it twice ensures
+		// objects that only became unreachable in *this* cycle are also
+		// finalized before close() returns, rather than being deferred to
+		// whatever future GC activity happens to run next (possibly after
+		// the caller's other members have already started tearing down).
+		lua_gc(*this, LUA_GCCOLLECT, 0);
+		lua_gc(*this, LUA_GCCOLLECT, 0);
+
+		closed = true;
+	}
+
 	Lua(const Lua&) = delete;
 	Lua& operator=(const Lua&) = delete;
 	Lua(Lua&&) = delete;
@@ -497,6 +550,7 @@ class Lua final
 		// failure leaves Lua's state untouched.
 		std::shared_ptr<LuaFunc> fn(std::move(wrapper));
 		registered_funcs.push_back(fn);
+		registered_global_names.emplace_back(name);
 
 		push_weak_upvalue(*this, fn);
 		lua_pushcclosure(*this, &Lua::trampoline, 1);
@@ -569,6 +623,16 @@ class Lua final
 	// observes an expired weak_ptr and raises a catchable Lua error instead of
 	// dereferencing freed memory.
 	std::list<std::shared_ptr<LuaFunc>> registered_funcs;
+
+	// Names registered as Lua globals via expose_func/register_global_func -
+	// used by close() to nil them out. expose_method/expose_mutable_method
+	// entries are intentionally NOT tracked here; they live in per-type
+	// metatables in the Lua registry, not as globals - see close().
+	std::vector<std::string> registered_global_names;
+
+	// Set by close(); guards against redundant nil-ing/GC work if close() is
+	// called more than once. See close() for the full rationale.
+	bool closed = false;
 
 	LuaStatePtr state{luaL_newstate(), [](lua_State* L) { lua_close(L); }};
 

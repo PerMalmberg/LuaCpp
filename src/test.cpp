@@ -461,10 +461,78 @@ TEST_CASE("expose_func: shared_ptr owner survives after local shared_ptr is rese
 		// `counter` goes out of scope here; the closure's own shared_ptr copy
 		// keeps the int alive.
 	}
-	auto [ok, err] = lua.run_script("bump(); bump()");
+auto [ok, err] = lua.run_script("bump(); bump()");
 	REQUIRE(ok);
 	auto [ok2, err2, result] = lua.call<int>("bump"); // bump has no return value; call<int> should fail cleanly
 	REQUIRE_FALSE(ok2);
+}
+
+// ============================================================
+// close() - explicit early teardown (LIFETIME.md item 3)
+// ============================================================
+
+TEST_CASE("close(): nils registered globals", "[lifetime]")
+{
+	Lua lua;
+	lua.expose_func<int>("add", std::function<int(int, int)>([](int a, int b) { return a + b; }));
+
+	auto [ok1, err1, r1] = lua.call<int>("add", 1, 2);
+	REQUIRE(ok1);
+	REQUIRE(r1 == 3);
+
+	lua.close();
+
+	auto [ok2, err2] = lua.run_script("assert(add == nil)");
+	REQUIRE(ok2);
+}
+
+TEST_CASE("close(): is idempotent", "[lifetime]")
+{
+	Lua lua;
+	lua.expose_func("noop", std::function<void()>([]() {}));
+	lua.close();
+	lua.close(); // must not throw / crash / double-free
+	SUCCEED();
+}
+
+TEST_CASE("close(): forces a GC cycle that runs script-set __gc metamethods while C++ state is still alive",
+          "[lifetime]")
+{
+	// Simulates the scenario from LIFETIME.md item 3: a registered closure
+	// captures a raw reference to a C++ object (`value` here plays the role
+	// of a sibling member in an embedding class). A Lua script attaches that
+	// closure as a __gc metamethod on a table it then drops. Calling close()
+	// forces the GC to finalize that table - and therefore invoke the
+	// closure - immediately, while `value` is still fully alive, rather than
+	// leaving the timing to whatever GC activity happens to run later.
+	int value = 42;
+	bool called = false;
+	int observed = -1;
+
+	Lua lua;
+	lua.expose_func("on_finalize", std::function<void()>(
+	                               [&]()
+	                               {
+		                               called = true;
+		                               observed = value;
+	                               }));
+
+	auto [ok, err] = lua.run_script(R"(
+		local fn = on_finalize -- capture the closure value itself as an upvalue,
+		                       -- not by looking up the global name again later -
+		                       -- close() nils the global before running the GC.
+		local t = {}
+		setmetatable(t, {__gc = function() fn() end})
+		t = nil
+	)");
+	REQUIRE(ok);
+
+	REQUIRE_FALSE(called); // nothing guarantees the GC has run yet
+
+	lua.close();
+
+	REQUIRE(called);
+	REQUIRE(observed == 42);
 }
 
 // ============================================================
