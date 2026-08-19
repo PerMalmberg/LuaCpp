@@ -94,7 +94,7 @@ struct has_lua_fields<T, std::void_t<decltype(LuaFields<T>::value)>> : std::true
 
 #define LUA_REGISTER_STRUCT(Type, ...)                                                                                 \
 	template <>                                                                                                        \
-	struct LuaFields<Type>                                                                                             \
+	struct ::LuaFields<Type>                                                                                           \
 	{                                                                                                                  \
 		static constexpr auto value = std::make_tuple(__VA_ARGS__);                                                    \
 	};
