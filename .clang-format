@@ -56,7 +56,7 @@ BreakConstructorInitializers: BeforeColon
 ColumnLimit: 120
 
 # A regular expression that describes comments with special meaning, which should not be split into lines or otherwise changed.
-CommentPragmas: '^ IWYU pragma:'
+CommentPragmas: "^ IWYU pragma:"
 
 # If the constructor initializers don’t fit on a line, put each initializer on its own line.
 ConstructorInitializerAllOnOneLineOrOnePerLine: true
@@ -164,4 +164,4 @@ Standard: Auto
 TabWidth: 4
 
 # The way to use tab characters in the resulting file. Possible values: Never, ForIndentation, Always.
-UseTab: ForIndentation
+UseTab: Never
