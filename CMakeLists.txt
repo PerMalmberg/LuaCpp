@@ -38,7 +38,30 @@ list(REMOVE_ITEM LUA_SOURCES
     "${LUA_SRC_DIR}/luac.c"
 )
 
-add_library(lua_static STATIC ${LUA_SOURCES})
+# Compile Lua as C++ while keeping the public API's C linkage.
+#
+# Lua's headers (lua.h/lauxlib.h/lualib.h) do NOT wrap their declarations in
+# extern "C" themselves - callers are expected to do that (as Lua.hpp does).
+# If we simply compiled each .c file individually as C++ (LANGUAGE CXX), the
+# *definitions* in those translation units would get C++ name-mangled since
+# they never see an extern "C" block, causing linker errors against code
+# that consumes the C-linkage declarations. To avoid that mismatch while
+# still compiling everything with the C++ compiler, generate a single unity
+# translation unit that #includes every Lua source file inside an
+# extern "C" block.
+set(LUA_CXX_WRAPPER "${CMAKE_BINARY_DIR}/generated/lua_cxx_wrapper.cpp")
+
+set(_lua_wrapper_content "// Auto-generated: compiles the Lua sources as C++ with C linkage.\n")
+string(APPEND _lua_wrapper_content "extern \"C\" {\n")
+foreach(_lua_src IN LISTS LUA_SOURCES)
+  string(APPEND _lua_wrapper_content "#include \"${_lua_src}\"\n")
+endforeach()
+string(APPEND _lua_wrapper_content "}\n")
+
+file(WRITE ${LUA_CXX_WRAPPER} "${_lua_wrapper_content}")
+
+add_library(lua_static STATIC ${LUA_CXX_WRAPPER})
+set_source_files_properties(${LUA_CXX_WRAPPER} PROPERTIES LANGUAGE CXX)
 
 target_include_directories(lua_static PUBLIC ${LUA_SRC_DIR})
 
