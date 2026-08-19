@@ -9,21 +9,30 @@ The `registered_funcs` vector-reallocation hazard has already been fixed
 
 ## 1. Lambda captures with references in `expose_func` / `expose_method`
 
-**Risk:** A lambda passed to `expose_func` or `expose_method` may capture C++
-objects by reference. `registered_funcs` (and therefore the closure) is owned
-by the `Lua` instance, but the captured referent may have a shorter lifetime.
-Calling the Lua function after the referent is destroyed is silent UB.
+**Status: Resolved.** Both `expose_func` and `expose_method` now have an
+overload that takes a `std::shared_ptr<Owner> owner` argument between `name`
+and the `std::function`:
 
-**Current state:** Documented as a pitfall comment in `Lua.hpp`. Not enforced.
+```cpp
+lua.expose_func("read_sensor", sensor /* shared_ptr<Sensor> */,
+    std::function<int()>([raw = sensor.get()]{ return raw->read(); }));
 
-**Options:**
-- Enforce value captures only (not possible to detect at compile time for
-  arbitrary lambdas).
-- Document and add a test that demonstrates safe (value capture) vs unsafe
-  (reference capture to local) patterns.
-- Wrap the stored callable in a `std::shared_ptr`; require callers to pass a
-  `shared_ptr` to the owning object alongside the lambda so the closure keeps
-  it alive.
+lua.expose_method<Point>("log_x", log /* shared_ptr<Log> */,
+    std::function<void(Point)>([raw = log.get()](Point p){ raw->push_back(p.x); }));
+```
+
+The closure captures a copy of `owner` by value alongside `func`, so a live
+reference into `*owner` (or into something it owns) stays valid for as long
+as the closure is registered - even if every other `shared_ptr` to the same
+object is released. The original risk (a captured raw reference outliving
+its referent) still exists for callers who ignore this overload and capture
+a plain reference to a shorter-lived object; the pitfall comment on both
+functions now points at this overload as the fix.
+
+See `expose_func`/`expose_method` in `Lua.hpp` and the
+`[lifetime]`-tagged tests in `test.cpp` for the implementation and
+verification (including a test that resets the caller's own `shared_ptr`
+before invoking the registered closure).
 
 ---
 

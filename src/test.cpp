@@ -433,6 +433,39 @@ TEST_CASE("expose_func: usable inside a Lua function", "[expose_func]")
 }
 
 // ============================================================
+// expose_func / expose_method - shared_ptr<Owner> keep-alive overload
+// ============================================================
+
+TEST_CASE("expose_func: shared_ptr owner keeps referenced object alive", "[expose_func][lifetime]")
+{
+	Lua lua;
+	auto counter = std::make_shared<int>(0);
+
+	// Lambda captures a raw reference into *counter; the shared_ptr overload
+	// keeps `counter` alive inside the closure for as long as it is registered,
+	// even though the local `counter` variable here still also owns it.
+	lua.expose_func("bump", counter, std::function<void()>([raw = counter.get()]() { ++(*raw); }));
+
+	lua.run_script("bump(); bump(); bump()");
+	REQUIRE(*counter == 3);
+}
+
+TEST_CASE("expose_func: shared_ptr owner survives after local shared_ptr is reset", "[expose_func][lifetime]")
+{
+	Lua lua;
+	{
+		auto counter = std::make_shared<int>(0);
+		lua.expose_func("bump", counter, std::function<void()>([raw = counter.get()]() { ++(*raw); }));
+		// `counter` goes out of scope here; the closure's own shared_ptr copy
+		// keeps the int alive.
+	}
+	auto [ok, err] = lua.run_script("bump(); bump()");
+	REQUIRE(ok);
+	auto [ok2, err2, result] = lua.call<int>("bump"); // bump has no return value; call<int> should fail cleanly
+	REQUIRE_FALSE(ok2);
+}
+
+// ============================================================
 // expose_func - error cases
 // ============================================================
 
@@ -594,6 +627,21 @@ TEST_CASE("struct: two distinct instances have independent values in Lua", "[str
 	REQUIRE(ok);
 	REQUIRE(sum_a == 3); // 1 + 2
 	REQUIRE(sum_b == 30); // 10 + 20
+}
+
+TEST_CASE("expose_method: shared_ptr owner keeps referenced object alive", "[expose_method][lifetime]")
+{
+	Lua lua;
+	auto log = std::make_shared<std::vector<int>>();
+
+	lua.expose_method<Point>("log_x", log,
+	                         std::function<void(Point)>([raw = log.get()](Point p) { raw->push_back(p.x); }));
+	lua.assign("p", Point{5, 6});
+	lua.run_script("p:log_x(); p:log_x()");
+
+	REQUIRE(log->size() == 2);
+	REQUIRE((*log)[0] == 5);
+	REQUIRE((*log)[1] == 5);
 }
 
 // ============================================================

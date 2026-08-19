@@ -254,51 +254,35 @@ class Lua final
 	//     disabled via static_assert to prevent dangling pointers into Lua
 	//     memory. Use std::string instead.
 	//   - Lambda captures that hold references must outlive the Lua instance.
-	//     Value captures are always safe.
+	//     Value captures are always safe. If a reference capture is needed,
+	//     use the overload below that takes a std::shared_ptr<Owner> so the
+	//     referent's lifetime is tied to the registered closure instead.
 	//   - Registering a name that already exists as a Lua global silently
 	//     replaces it; no warning is produced.
 	template <typename... ReturnTypes, typename... Args>
 	void expose_func(const char* name, std::function<lua_return_t<ReturnTypes...>(Args...)> func)
 	{
-		// Typed wrapper: validates argument count, reads typed arguments, invokes
-		// the C++ function, and pushes return values onto the Lua stack.
-		// Throws std::runtime_error on argument count or type mismatch.
-		auto wrapper = std::make_unique<LuaFunc>(
-		[func = std::move(func)](lua_State* L) -> int
-		{
-			constexpr int expected = static_cast<int>(sizeof...(Args));
-			if(const int got = lua_gettop(L); got != expected)
-				throw std::runtime_error("expected " + std::to_string(expected) + " argument(s), got " +
-				                         std::to_string(got));
+		register_global_func(name, make_func_wrapper<ReturnTypes...>(std::move(func), NoOwner{}));
+	}
 
-			auto args = collect_args_from<Args...>(L, 1, std::index_sequence_for<Args...>{});
-
-			if constexpr(sizeof...(ReturnTypes) == 0)
-			{
-				std::apply(func, std::move(args));
-				return 0;
-			}
-			else if constexpr(sizeof...(ReturnTypes) == 1)
-			{
-				push(L, std::apply(func, std::move(args)));
-				return 1;
-			}
-			else
-			{
-				auto results = std::apply(func, std::move(args));
-				push_results(L, results, std::index_sequence_for<ReturnTypes...>{});
-				return static_cast<int>(sizeof...(ReturnTypes));
-			}
-		});
-
-		// Transfer ownership before touching the Lua stack so that an allocation
-		// failure leaves Lua's state untouched.
-		registered_funcs.push_back(std::move(wrapper));
-		LuaFunc* fn_ptr = registered_funcs.back().get();
-
-		lua_pushlightuserdata(*this, fn_ptr);
-		lua_pushcclosure(*this, &Lua::trampoline, 1);
-		lua_setglobal(*this, name);
+	// Same as expose_func above, but keeps `owner` alive for as long as the
+	// registered Lua closure exists (i.e. for the lifetime of this Lua
+	// instance, or until it is replaced/erased). Use this overload whenever
+	// `func` captures a reference to *owner, or to something owned by it,
+	// so the closure can never outlive the referent - the shared_ptr copy
+	// captured inside the closure keeps the object alive even if all other
+	// owners release it.
+	//
+	// Example:
+	//   auto sensor = std::make_shared<Sensor>();
+	//   lua.expose_func<int>("read_sensor", sensor,
+	//       std::function<int()>([s = sensor.get()]{ return s->read(); }));
+	template <typename... ReturnTypes, typename... Args, typename Owner>
+	void expose_func(const char* name,
+	                 std::shared_ptr<Owner> owner,
+	                 std::function<lua_return_t<ReturnTypes...>(Args...)> func)
+	{
+		register_global_func(name, make_func_wrapper<ReturnTypes...>(std::move(func), std::move(owner)));
 	}
 
 	// Registers a C++ callable as a named method on all Lua instances of StructType.
@@ -331,45 +315,37 @@ class Lua final
 	//     inside the C++ function are NOT written back to Lua. Use
 	//     expose_mutable_method when the struct must be updated in place.
 	//   - const char* cannot be used as an Arg or ReturnType (see expose_func).
+	//   - Lambda captures that hold references must outlive the Lua instance.
+	//     Value captures are always safe. Use the std::shared_ptr<Owner> overload
+	//     below when a reference capture to a shorter-lived object is needed.
 	template <typename StructType, typename... ReturnTypes, typename... Args>
 	void expose_method(const char* name, std::function<lua_return_t<ReturnTypes...>(StructType, Args...)> func)
 	{
 		static_assert(has_lua_fields<StructType>::value,
 		              "expose_method: StructType must be registered with LUA_REGISTER_STRUCT");
 
-		auto wrapper = std::make_unique<LuaFunc>(
-		[func = std::move(func)](lua_State* L) -> int
-		{
-			constexpr int n_method_args = static_cast<int>(sizeof...(Args));
-			constexpr int expected = n_method_args + 1; // +1 for implicit self
-			if(const int got = lua_gettop(L); got != expected)
-				throw std::runtime_error("expected " + std::to_string(n_method_args) + " argument(s), got " +
-				                         std::to_string(got - 1));
-
-			auto self = read<StructType>(L, 1);
-			auto args = collect_args_from<Args...>(L, 2, std::index_sequence_for<Args...>{});
-			auto all_args = std::tuple_cat(std::make_tuple(std::move(self)), std::move(args));
-
-			if constexpr(sizeof...(ReturnTypes) == 0)
-			{
-				std::apply(func, std::move(all_args));
-				return 0;
-			}
-			else if constexpr(sizeof...(ReturnTypes) == 1)
-			{
-				push(L, std::apply(func, std::move(all_args)));
-				return 1;
-			}
-			else
-			{
-				auto results = std::apply(func, std::move(all_args));
-				push_results(L, results, std::index_sequence_for<ReturnTypes...>{});
-				return static_cast<int>(sizeof...(ReturnTypes));
-			}
-		});
-
+		auto wrapper = make_method_wrapper<StructType, ReturnTypes...>(std::move(func), NoOwner{});
+		LuaFunc* fn_ptr = wrapper.get();
 		registered_funcs.push_back(std::move(wrapper));
-		LuaFunc* fn_ptr = registered_funcs.back().get();
+
+		add_method_to_registry<StructType>(*this, name, fn_ptr);
+	}
+
+	// Same as expose_method above, but keeps `owner` alive for as long as the
+	// registered Lua closure exists. Use this overload whenever `func`
+	// captures a reference to *owner, or to something owned by it - see
+	// expose_func(name, owner, func) for the full rationale.
+	template <typename StructType, typename... ReturnTypes, typename... Args, typename Owner>
+	void expose_method(const char* name,
+	                   std::shared_ptr<Owner> owner,
+	                   std::function<lua_return_t<ReturnTypes...>(StructType, Args...)> func)
+	{
+		static_assert(has_lua_fields<StructType>::value,
+		              "expose_method: StructType must be registered with LUA_REGISTER_STRUCT");
+
+		auto wrapper = make_method_wrapper<StructType, ReturnTypes...>(std::move(func), std::move(owner));
+		LuaFunc* fn_ptr = wrapper.get();
+		registered_funcs.push_back(std::move(wrapper));
 
 		add_method_to_registry<StructType>(*this, name, fn_ptr);
 	}
@@ -461,6 +437,107 @@ class Lua final
 	using LuaCloser = std::function<void(lua_State*)>;
 	using LuaStatePtr = std::unique_ptr<lua_State, LuaCloser>;
 	using LuaFunc = std::function<int(lua_State*)>;
+
+	// Default "keep-alive" object for the expose_func / expose_method overloads
+	// that do not take an explicit owner. Capturing an empty struct by value in
+	// the closure has no runtime cost.
+	struct NoOwner
+	{
+	};
+
+	// Builds the typed trampoline closure shared by both expose_func overloads.
+	// `keep_alive` is captured by value inside the closure purely to extend the
+	// lifetime of an owning object that `func`'s captures may reference; it is
+	// never otherwise accessed. Pass NoOwner{} when there is nothing to keep
+	// alive - see the expose_func(name, owner, func) overload for the rationale.
+	template <typename... ReturnTypes, typename... Args, typename KeepAlive>
+	static std::unique_ptr<LuaFunc> make_func_wrapper(std::function<lua_return_t<ReturnTypes...>(Args...)> func,
+	                                                  KeepAlive keep_alive)
+	{
+		// Typed wrapper: validates argument count, reads typed arguments, invokes
+		// the C++ function, and pushes return values onto the Lua stack.
+		// Throws std::runtime_error on argument count or type mismatch.
+		return std::make_unique<LuaFunc>(
+		[func = std::move(func), keep_alive = std::move(keep_alive)](lua_State* L) -> int
+		{
+			constexpr int expected = static_cast<int>(sizeof...(Args));
+			if(const int got = lua_gettop(L); got != expected)
+				throw std::runtime_error("expected " + std::to_string(expected) + " argument(s), got " +
+				                         std::to_string(got));
+
+			auto args = collect_args_from<Args...>(L, 1, std::index_sequence_for<Args...>{});
+
+			if constexpr(sizeof...(ReturnTypes) == 0)
+			{
+				std::apply(func, std::move(args));
+				return 0;
+			}
+			else if constexpr(sizeof...(ReturnTypes) == 1)
+			{
+				push(L, std::apply(func, std::move(args)));
+				return 1;
+			}
+			else
+			{
+				auto results = std::apply(func, std::move(args));
+				push_results(L, results, std::index_sequence_for<ReturnTypes...>{});
+				return static_cast<int>(sizeof...(ReturnTypes));
+			}
+		});
+	}
+
+	// Transfers ownership of `wrapper` into registered_funcs and registers the
+	// resulting trampoline closure as a Lua global named `name`.
+	void register_global_func(const char* name, std::unique_ptr<LuaFunc> wrapper)
+	{
+		// Transfer ownership before touching the Lua stack so that an allocation
+		// failure leaves Lua's state untouched.
+		registered_funcs.push_back(std::move(wrapper));
+		LuaFunc* fn_ptr = registered_funcs.back().get();
+
+		lua_pushlightuserdata(*this, fn_ptr);
+		lua_pushcclosure(*this, &Lua::trampoline, 1);
+		lua_setglobal(*this, name);
+	}
+
+	// Builds the typed trampoline closure shared by both expose_method overloads.
+	// See make_func_wrapper for the meaning of `keep_alive`.
+	template <typename StructType, typename... ReturnTypes, typename... Args, typename KeepAlive>
+	static std::unique_ptr<LuaFunc> make_method_wrapper(
+	std::function<lua_return_t<ReturnTypes...>(StructType, Args...)> func,
+	KeepAlive keep_alive)
+	{
+		return std::make_unique<LuaFunc>(
+		[func = std::move(func), keep_alive = std::move(keep_alive)](lua_State* L) -> int
+		{
+			constexpr int n_method_args = static_cast<int>(sizeof...(Args));
+			constexpr int expected = n_method_args + 1; // +1 for implicit self
+			if(const int got = lua_gettop(L); got != expected)
+				throw std::runtime_error("expected " + std::to_string(n_method_args) + " argument(s), got " +
+				                         std::to_string(got - 1));
+
+			auto self = read<StructType>(L, 1);
+			auto args = collect_args_from<Args...>(L, 2, std::index_sequence_for<Args...>{});
+			auto all_args = std::tuple_cat(std::make_tuple(std::move(self)), std::move(args));
+
+			if constexpr(sizeof...(ReturnTypes) == 0)
+			{
+				std::apply(func, std::move(all_args));
+				return 0;
+			}
+			else if constexpr(sizeof...(ReturnTypes) == 1)
+			{
+				push(L, std::apply(func, std::move(all_args)));
+				return 1;
+			}
+			else
+			{
+				auto results = std::apply(func, std::move(all_args));
+				push_results(L, results, std::index_sequence_for<ReturnTypes...>{});
+				return static_cast<int>(sizeof...(ReturnTypes));
+			}
+		});
+	}
 
 	// Positive indexes are from the bottom of the stack, negative indexes are
 	// from the top of the stack. -1 = top, -2 = second from top, etc.
