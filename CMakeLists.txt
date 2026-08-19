@@ -45,23 +45,33 @@ list(REMOVE_ITEM LUA_SOURCES
 # If we simply compiled each .c file individually as C++ (LANGUAGE CXX), the
 # *definitions* in those translation units would get C++ name-mangled since
 # they never see an extern "C" block, causing linker errors against code
-# that consumes the C-linkage declarations. To avoid that mismatch while
-# still compiling everything with the C++ compiler, generate a single unity
-# translation unit that #includes every Lua source file inside an
-# extern "C" block.
-set(LUA_CXX_WRAPPER "${CMAKE_BINARY_DIR}/generated/lua_cxx_wrapper.cpp")
+# that consumes the C-linkage declarations.
+#
+# We generate one tiny wrapper .cpp PER Lua source file (rather than a single
+# unity/amalgamated translation unit). Each wrapper just does:
+#   extern "C" { #include "<file>.c" }
+# This keeps every file compiled as its own separate translation unit, just
+# like upstream Lua's normal build - which matters because merging all the
+# sources into one giant TU lets the optimizer inline/analyze *across*
+# former file boundaries. That can expose the classic (and otherwise latent)
+# setjmp/longjmp pitfall where non-volatile locals modified after setjmp()
+# have indeterminate values after a longjmp, particularly under
+# optimization - which is exactly what was crashing (STATUS_HEAP_CORRUPTION)
+# on MSVC in the error-handling code paths (luaL_error / lua_error) once
+# everything was amalgamated into a single translation unit.
+set(LUA_CXX_WRAPPER_DIR "${CMAKE_BINARY_DIR}/generated/lua_cxx")
+file(MAKE_DIRECTORY ${LUA_CXX_WRAPPER_DIR})
 
-set(_lua_wrapper_content "// Auto-generated: compiles the Lua sources as C++ with C linkage.\n")
-string(APPEND _lua_wrapper_content "extern \"C\" {\n")
+set(LUA_CXX_WRAPPERS "")
 foreach(_lua_src IN LISTS LUA_SOURCES)
-  string(APPEND _lua_wrapper_content "#include \"${_lua_src}\"\n")
+  get_filename_component(_lua_src_name "${_lua_src}" NAME_WE)
+  set(_wrapper "${LUA_CXX_WRAPPER_DIR}/${_lua_src_name}_cxx.cpp")
+  file(WRITE "${_wrapper}" "// Auto-generated: compiles ${_lua_src_name}.c as C++ with C linkage.\nextern \"C\" {\n#include \"${_lua_src}\"\n}\n")
+  list(APPEND LUA_CXX_WRAPPERS "${_wrapper}")
 endforeach()
-string(APPEND _lua_wrapper_content "}\n")
 
-file(WRITE ${LUA_CXX_WRAPPER} "${_lua_wrapper_content}")
-
-add_library(lua_static STATIC ${LUA_CXX_WRAPPER})
-set_source_files_properties(${LUA_CXX_WRAPPER} PROPERTIES LANGUAGE CXX)
+add_library(lua_static STATIC ${LUA_CXX_WRAPPERS})
+set_source_files_properties(${LUA_CXX_WRAPPERS} PROPERTIES LANGUAGE CXX)
 
 target_include_directories(lua_static PUBLIC ${LUA_SRC_DIR})
 
@@ -83,7 +93,10 @@ if(MSVC)
   target_compile_options(lua_static PRIVATE /O2 /W3)
   target_compile_definitions(lua_static PRIVATE _CRT_SECURE_NO_WARNINGS)
 elseif(APPLE)
-  target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra -Werror -Wno-error=maybe-uninitialized)
+  # AppleClang doesn't know the GCC-specific -Wmaybe-uninitialized warning;
+  # use its closest equivalent instead (see the Linux branch below for why
+  # this is downgraded from an error).
+  target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra -Werror -Wno-error=uninitialized)
   target_compile_definitions(lua_static PRIVATE LUA_USE_MACOSX)
   target_link_libraries(lua_static PUBLIC m)
 else() # Linux
