@@ -8,21 +8,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# MSVC defaults to /EHsc (synchronous C++ exceptions only), which Microsoft
-# documents as unsafe to combine with setjmp/longjmp: jumping across frames
-# compiled with /EHsc can corrupt the compiler's table-driven unwind info,
-# especially under optimization. Since Lua (compiled as C++ via the wrapper
-# trick below) uses classic setjmp/longjmp for its error handling
-# (LUA_USE_LONGJMP), replace /EHsc with /EHa - which correctly integrates
-# SEH-style unwinding with longjmp - for every target in this project.
-# Without this, Release builds intermittently crash with
-# STATUS_HEAP_CORRUPTION (0xc0000374) specifically in Lua error-path tests
-# (luaL_error / wrong-arg-type / too-many-or-few-args / stack-hygiene-after-
-# error tests).
-if(MSVC)
-  string(REPLACE "/EHsc" "/EHa" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-endif()
-
 # ---------------------------------------------------------------------------
 # Fetch Lua 5.5.0 sources
 # ---------------------------------------------------------------------------
@@ -108,6 +93,33 @@ target_include_directories(lua_static PUBLIC ${LUA_SRC_DIR})
 if(MSVC)
   target_compile_options(lua_static PRIVATE $<$<NOT:$<CONFIG:Debug>>:/O2> /W3)
   target_compile_definitions(lua_static PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+  # MSVC defaults to /EHsc (synchronous C++ exceptions only). Even though
+  # Lua no longer uses setjmp/longjmp for error handling (LUA_USE_LONGJMP is
+  # intentionally not defined - see above), /EHa is kept as a defense-in-
+  # depth requirement: it is documented by Microsoft as the correct model
+  # whenever C code with its own error/unwind conventions is compiled as
+  # C++ and mixed with real C++ exceptions, and protects against any future
+  # reintroduction of LUA_USE_LONGJMP (by this project or a consumer) or
+  # any other latent setjmp/longjmp use inside Lua.
+  #
+  # PUBLIC (not PRIVATE) is essential here: this project is meant to be
+  # consumed as a library (via add_subdirectory/FetchContent/find_package)
+  # from a much larger project. A PRIVATE flag, or mutating the global
+  # CMAKE_CXX_FLAGS as an earlier version of this file did, only affects
+  # translation units built inside THIS CMakeLists.txt - it does not reach
+  # the consumer's own targets that #include Lua.hpp and call into it. By
+  # attaching /EHa (and /bigobj, needed because /EHa generates more unwind
+  # metadata) as a PUBLIC usage requirement on lua_static, CMake
+  # automatically appends both flags to the compile command line of any
+  # target that does target_link_libraries(<consumer> PRIVATE|PUBLIC
+  # lua_static) - including in a completely separate top-level project.
+  # MSVC resolves conflicting /EH* switches by taking the last one on the
+  # command line, and CMake always places a target's own (PUBLIC/INTERFACE)
+  # compile options after the directory-wide defaults, so this reliably
+  # overrides the consumer's default /EHsc without them having to do
+  # anything themselves.
+  target_compile_options(lua_static PUBLIC /EHa /bigobj)
 elseif(APPLE)
   # AppleClang doesn't know the GCC-specific -Wmaybe-uninitialized warning;
   # use its closest equivalent instead (see the Linux branch below for why
@@ -131,7 +143,7 @@ endif()
 add_executable(main src/main.cpp)
 target_link_libraries(main PRIVATE lua_static)
 if(MSVC)
-  target_compile_options(main PRIVATE $<$<NOT:$<CONFIG:Debug>>:/O2> /W4 /WX /bigobj)
+  target_compile_options(main PRIVATE $<$<NOT:$<CONFIG:Debug>>:/O2> /W4 /WX)
 else()
   target_compile_options(main PRIVATE -O2 -Wall -Wextra -Werror)
 endif()
@@ -151,7 +163,7 @@ include(Catch)
 add_executable(tests src/test.cpp)
 target_link_libraries(tests PRIVATE lua_static Catch2::Catch2WithMain)
 if(MSVC)
-  target_compile_options(tests PRIVATE $<$<NOT:$<CONFIG:Debug>>:/O2> /W4 /WX /bigobj)
+  target_compile_options(tests PRIVATE $<$<NOT:$<CONFIG:Debug>>:/O2> /W4 /WX)
 else()
   target_compile_options(tests PRIVATE -O2 -Wall -Wextra -Werror)
 endif()

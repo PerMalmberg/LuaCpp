@@ -98,6 +98,53 @@ Release flow and the `debug` preset - 168/168 passing every time, no
 flakiness. Also updated LIFETIME.md item 2 ("Bug fixed along the way")
 to note the historical bug/fix and that the split has since been removed.
 
+## /EHa must propagate to CONSUMERS, not just this project's own targets
+
+LuaCpp is meant to be consumed as a library (add_subdirectory/FetchContent/
+find_package) by a much bigger project. Mutating the global CMAKE_CXX_FLAGS
+(the original /EHa fix) or using PRIVATE target_compile_options only affects
+translation units built from THIS CMakeLists.txt - it does NOT reach a
+consuming project's own targets that #include Lua.hpp and call into it.
+Those consumer TUs still need /EHa themselves (since they may have try/catch
+frames that Lua's exceptions propagate through, e.g. trampoline()'s
+try/catch, or any RAII objects on the stack during a Lua call).
+
+Fix: attach /EHa (and /bigobj, needed because /EHa generates more unwind
+metadata) as a PUBLIC usage requirement directly on the `lua_static` CMake
+target:
+```cmake
+if(MSVC)
+  target_compile_options(lua_static PUBLIC /EHa /bigobj)
+endif()
+```
+PUBLIC (not PRIVATE) means CMake automatically appends these flags to the
+compile command line of ANY target that does
+target_link_libraries(<consumer> PRIVATE|PUBLIC lua_static) - including in
+a completely separate top-level project - via INTERFACE_COMPILE_OPTIONS
+propagation. No CMAKE_CXX_FLAGS mutation needed at all anymore; removed it.
+
+MSVC resolves conflicting /EH* switches by taking the last one specified on
+the command line, and CMake always places a target's own compile options
+after the directory-wide defaults, so the consumer's own default /EHsc is
+reliably overridden without the consumer having to do anything themselves.
+
+Verified this actually works: rebuilt from scratch and saw
+`cl : Command line warning D9025 : overriding '/EHs' with '/EHa'` appear for
+ALL THREE targets (lua_static, main, tests) - including main/tests, which
+have no /EH flags of their own and only do target_link_libraries(...
+lua_static) - proving transitive propagation works exactly as intended.
+168/168 tests still pass (Release x5, Debug x3, no flakiness).
+
+Also noticed (informational, not a build failure): with /EHa, MSVC emits
+`C4297: 'luaD_throw'/'LUAI_TRY': function assumed not to throw an exception
+but does ... The function is extern "C" and /EHc was specified` for a
+couple of functions in ldo.c. This is because MSVC still assumes extern "C"
+functions don't throw by default even under /EHa (unless /EHc- is also
+given) - this is a real caveat of Lua's own C++-exception design (it throws
+across an extern "C" boundary), but it's a warning not an error, doesn't
+fail the build (no /WX on lua_static), and doesn't affect correctness
+(confirmed by the passing tests) - just a nuance worth knowing about.
+
 ## Other gotchas encountered
 - Lua's headers (lua.h/lauxlib.h/lualib.h) do NOT wrap declarations in
   extern "C" themselves; Lua.hpp already wraps its own #include of them in
