@@ -65,6 +65,17 @@ set_source_files_properties(${LUA_CXX_WRAPPER} PROPERTIES LANGUAGE CXX)
 
 target_include_directories(lua_static PUBLIC ${LUA_SRC_DIR})
 
+# Lua's ldo.c auto-selects its error-propagation mechanism based on whether
+# it detects a C++ compiler: when __cplusplus is defined it switches from
+# setjmp/longjmp to throwing/catching a raw `lua_longjmp*` as a C++
+# exception. That mode is not something the unmodified Lua C sources are
+# designed/tested for (no RAII, raw buffer/realloc management throughout),
+# and it has been observed to corrupt the heap on error paths under MSVC's
+# exception model (STATUS_HEAP_CORRUPTION / 0xc0000374). Force Lua back to
+# its classic, battle-tested setjmp/longjmp error handling even though the
+# sources are compiled as C++.
+target_compile_definitions(lua_static PRIVATE LUA_USE_LONGJMP)
+
 # Platform-specific Lua defines and system libraries.
 # lua.c (the interactive REPL) is excluded from the build so LUA_USE_READLINE
 # never pulls in libreadline on any platform.
@@ -72,11 +83,15 @@ if(MSVC)
   target_compile_options(lua_static PRIVATE /O2 /W3)
   target_compile_definitions(lua_static PRIVATE _CRT_SECURE_NO_WARNINGS)
 elseif(APPLE)
-  target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra -Werror)
+  target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra -Werror -Wno-error=maybe-uninitialized)
   target_compile_definitions(lua_static PRIVATE LUA_USE_MACOSX)
   target_link_libraries(lua_static PUBLIC m)
 else() # Linux
-  target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra -Werror)
+  # -Wmaybe-uninitialized triggers false positives in the (unmodified) Lua C
+  # sources once they are compiled as C++, because GCC's flow analysis for
+  # unions/structs differs between the two languages. Downgrade it to a
+  # warning instead of disabling -Werror for the rest of the target.
+  target_compile_options(lua_static PRIVATE -O2 -Wall -Wextra -Werror -Wno-error=maybe-uninitialized)
   target_compile_definitions(lua_static PRIVATE LUA_USE_LINUX)
   target_link_libraries(lua_static PUBLIC m dl)
 endif()
