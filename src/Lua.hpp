@@ -63,6 +63,21 @@ using lua_return_t = typename lua_return_type<Ts...>::type;
 //     read as nil, which causes a type error for most C++ member types.
 //   - Structs are always exchanged by value; each push or read copies the
 //     entire struct, including any container-typed fields.
+//   - If the struct lives in a namespace, LUA_REGISTER_STRUCT must still be
+//     invoked at GLOBAL scope, not inside that namespace's braces. The macro
+//     expands to an explicit specialization of the global-namespace template
+//     LuaFields<T>, and the C++ standard requires explicit specializations to
+//     be declared in a namespace enclosing the primary template - here, that
+//     means global scope, regardless of which namespace T itself is in. Refer
+//     to the type by its fully-qualified name:
+//
+//       namespace myapp { struct Foo { int x; }; }
+//       LUA_REGISTER_STRUCT(myapp::Foo, lua_field("x", &myapp::Foo::x)) // OK, at global scope
+//
+//       namespace myapp {
+//           struct Foo { int x; };
+//           LUA_REGISTER_STRUCT(Foo, lua_field("x", &Foo::x)) // ERROR: wrong namespace
+//       }
 // ---------------------------------------------------------------------------
 
 template <typename Struct, typename Member>
@@ -94,7 +109,7 @@ struct has_lua_fields<T, std::void_t<decltype(LuaFields<T>::value)>> : std::true
 
 #define LUA_REGISTER_STRUCT(Type, ...)                                                                                 \
 	template <>                                                                                                        \
-	struct ::LuaFields<Type>                                                                                           \
+	struct LuaFields<Type>                                                                                             \
 	{                                                                                                                  \
 		static constexpr auto value = std::make_tuple(__VA_ARGS__);                                                    \
 	};
@@ -252,9 +267,8 @@ class Lua final
 			return {false, "Not a function: " + std::string(func), ReturnTypes{}...};
 		}
 
-		(
-		push(state.get(), decay_for_push(std::forward<Args>(args))),
-		...); // C++17 fold expression to push all arguments onto the Lua stack
+		(push(state.get(), decay_for_push(std::forward<Args>(args))),
+		 ...); // C++17 fold expression to push all arguments onto the Lua stack
 
 		const auto arg_count = static_cast<int>(sizeof...(Args));
 		const auto ret_count = static_cast<int>(sizeof...(ReturnTypes));

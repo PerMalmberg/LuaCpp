@@ -254,6 +254,36 @@ LUA_REGISTER_STRUCT(Config,
 Only fields listed in the macro are exchanged. Extra Lua table keys are ignored
 on read; fields absent from a Lua table produce a type error.
 
+**Structs in a namespace** - `LUA_REGISTER_STRUCT` must still be invoked at
+**global scope**, even when the struct itself is declared inside a namespace.
+The macro expands to an explicit specialization of the global-namespace
+template `LuaFields<T>`, and the C++ standard requires explicit specializations
+to be declared in a namespace enclosing the *primary template* - here, that's
+global scope, regardless of which namespace `T` lives in. Refer to the type by
+its fully-qualified name and close the namespace before calling the macro:
+
+```cpp
+namespace myapp
+{
+    struct Foo { int x; int y; };
+} // namespace myapp
+
+// Correct: invoked at global scope, type referred to by its qualified name.
+LUA_REGISTER_STRUCT(myapp::Foo, lua_field("x", &myapp::Foo::x), lua_field("y", &myapp::Foo::y))
+```
+
+```cpp
+namespace myapp
+{
+    struct Foo { int x; int y; };
+    // ERROR: specialization declared in the wrong namespace.
+    LUA_REGISTER_STRUCT(Foo, lua_field("x", &Foo::x), lua_field("y", &Foo::y))
+}
+```
+
+The same rule applies to structs declared inside an anonymous namespace -
+move the `LUA_REGISTER_STRUCT` call outside the `namespace { ... }` block.
+
 **Construction from Lua** - Lua can create instances via table literals or a
 exposed factory function:
 

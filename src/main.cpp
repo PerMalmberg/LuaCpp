@@ -12,6 +12,30 @@
 #include <string>
 #include <vector>
 
+// A struct made exchangeable with Lua (as a table) via LUA_REGISTER_STRUCT.
+// Used throughout the rest of this file to demonstrate struct binding,
+// nesting, methods, and mutation.
+//
+// Defined at global (not anonymous-namespace) scope because explicit
+// specializations of LuaFields<T> (created by LUA_REGISTER_STRUCT) must be
+// declared in the same namespace that LuaFields itself lives in.
+struct Point
+{
+	int x = 0;
+	int y = 0;
+};
+LUA_REGISTER_STRUCT(Point, lua_field("x", &Point::x), lua_field("y", &Point::y))
+
+// A struct with a nested registered struct field and a container field, to
+// demonstrate that nesting and containers work with zero extra registration.
+struct Rect
+{
+	Point origin;
+	int w = 0;
+	int h = 0;
+};
+LUA_REGISTER_STRUCT(Rect, lua_field("origin", &Rect::origin), lua_field("w", &Rect::w), lua_field("h", &Rect::h))
+
 namespace
 {
 
@@ -19,26 +43,6 @@ namespace
 	{
 		std::cout << "\n=== " << title << " ===\n";
 	}
-
-	// A struct made exchangeable with Lua (as a table) via LUA_REGISTER_STRUCT.
-	// Used throughout the rest of this file to demonstrate struct binding,
-	// nesting, methods, and mutation.
-	struct Point
-	{
-		int x = 0;
-		int y = 0;
-	};
-	LUA_REGISTER_STRUCT(Point, lua_field("x", &Point::x), lua_field("y", &Point::y))
-
-	// A struct with a nested registered struct field and a container field, to
-	// demonstrate that nesting and containers work with zero extra registration.
-	struct Rect
-	{
-		Point origin;
-		int w = 0;
-		int h = 0;
-	};
-	LUA_REGISTER_STRUCT(Rect, lua_field("origin", &Rect::origin), lua_field("w", &Rect::w), lua_field("h", &Rect::h))
 
 	// ---------------------------------------------------------------------------
 	// run_script: execute a Lua string in the Lua instance's global state.
