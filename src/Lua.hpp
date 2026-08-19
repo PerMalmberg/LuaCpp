@@ -460,6 +460,7 @@ class Lua final
 		return std::make_unique<LuaFunc>(
 		[func = std::move(func), keep_alive = std::move(keep_alive)](lua_State* L) -> int
 		{
+			(void)keep_alive; // captured only to extend the owner's lifetime
 			constexpr int expected = static_cast<int>(sizeof...(Args));
 			if(const int got = lua_gettop(L); got != expected)
 				throw std::runtime_error("expected " + std::to_string(expected) + " argument(s), got " +
@@ -511,6 +512,7 @@ class Lua final
 		return std::make_unique<LuaFunc>(
 		[func = std::move(func), keep_alive = std::move(keep_alive)](lua_State* L) -> int
 		{
+			(void)keep_alive; // captured only to extend the owner's lifetime
 			constexpr int n_method_args = static_cast<int>(sizeof...(Args));
 			constexpr int expected = n_method_args + 1; // +1 for implicit self
 			if(const int got = lua_gettop(L); got != expected)
