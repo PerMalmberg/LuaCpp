@@ -368,6 +368,15 @@ class Lua final
 	//   - self is read from the Lua table by value on every call. Mutations
 	//     inside the C++ function are NOT written back to Lua. Use
 	//     expose_mutable_method when the struct must be updated in place.
+	//   - self is a BY-VALUE COPY local to this call, living on the C++ call
+	//     stack (or, for expose_mutable_method, additionally captured by value
+	//     before being written back - see below). Storing its address (e.g.
+	//     &self, or a pointer/reference into one of its fields) anywhere that
+	//     outlives the call - a global registry, a singleton, a captured
+	//     lambda, another container - leaves a dangling pointer the moment the
+	//     method returns; the stack slot is reused or popped immediately
+	//     afterward. Copy the value (or the specific field) instead of taking
+	//     its address.
 	//   - const char* cannot be used as an Arg or ReturnType (see expose_func).
 	//   - Lambda captures that hold references must outlive the Lua instance.
 	//     Value captures are always safe. Use the std::shared_ptr<Owner> overload
@@ -439,6 +448,13 @@ class Lua final
 	//     fields are written back. There is no shared pointer into Lua memory;
 	//     all exchanged fields must be copyable value types (or supported
 	//     containers / registered structs thereof).
+	//   - self is a BY-VALUE COPY local to this call (see expose_method's
+	//     pitfall above for the full rationale). Even though it is passed as
+	//     StructType&, that reference refers to a local variable on this call's
+	//     C++ stack, NOT to any Lua-managed memory. Storing &self (or a
+	//     pointer/reference into one of its fields) anywhere that outlives the
+	//     call leaves a dangling pointer; the write-back to Lua happens
+	//     separately, by value, after the function returns.
 	template <typename StructType, typename... ReturnTypes, typename... Args>
 	void expose_mutable_method(const char* name, std::function<lua_return_t<ReturnTypes...>(StructType&, Args...)> func)
 	{

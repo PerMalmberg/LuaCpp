@@ -145,11 +145,30 @@ stack, passes it by value as `self`, then writes it back. If the method body
 stores the address of `self` (e.g., in a global registry or singleton), that
 pointer refers to a dead stack variable the moment the method returns.
 
-**Current state:** Undocumented.
+**Status: Documented.** Both `expose_method` and `expose_mutable_method` now
+have a pitfall comment stating that `self` is a **by-value copy local to the
+call**, living on the C++ call stack:
 
-**Plan:** Add a pitfall comment to `expose_method` and `expose_mutable_method`
-stating that `self` is a by-value copy local to the call; its address must not
-escape the function body.
+- `expose_method` receives `self` by value (`StructType`) directly, so this
+  was already implied by the signature, but the pitfall comment now spells
+  out the consequence explicitly: taking `&self` (or a pointer/reference to
+  one of its fields) and storing it anywhere that outlives the call - a
+  global registry, a singleton, a captured lambda - leaves a dangling
+  pointer the instant the method returns.
+- `expose_mutable_method` is the sharper trap: it receives `self` as
+  `StructType&`, which can look like a reference into persistent Lua-owned
+  memory. It is not - it is a reference to a local variable on the current
+  call's C++ stack that happens to get copied back into the Lua table
+  *after* the function returns. The comment now calls this out directly so
+  the reference-vs.-value distinction isn't missed just because the
+  parameter type has `&` in it.
+
+No code change was needed/possible here - the read-back-into-a-local /
+copy-mutate-write-back design (see `make_method_wrapper` and
+`expose_mutable_method`'s body in `Lua.hpp`) is inherent to how structs are
+exchanged with Lua-side tables, so the mitigation is purely a documentation
+one: make the pitfall impossible to miss in the API comments where callers
+write their closures.
 
 ---
 
