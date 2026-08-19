@@ -15,8 +15,11 @@
   instructions. Track total ops executed per `run_script` / `call`. Implemented as
   `enable_instruction_counting`/`disable_instruction_counting`/`get_instruction_count`.
 
-- [ ] **Memory tracking** — custom allocator via `lua_newstate` instead of `luaL_newstate`.
-  Intercepts every alloc/realloc/free and exposes live byte usage.
+- [x] **Memory tracking** — custom allocator via `lua_newstate` instead of `luaL_newstate`.
+  Intercepts every alloc/realloc/free and exposes live byte usage. Implemented as
+  `get_memory_usage`, backed by a custom `lua_Alloc` (`limited_alloc`) passed to
+  `lua_newstate`; also required installing our own panic handler (`lua_atpanic`) since
+  switching away from `luaL_newstate` means its automatic default one is no longer set.
 
 - [x] **Output capture** — replace the `print` global with a C function that appends to a
   buffer instead of writing to stdout. Implemented as `enable_output_capture`/
@@ -32,8 +35,11 @@
   with a catchable error. Prevents infinite loops and runaway scripts. Implemented as
   `set_instruction_limit`/`clear_instruction_limit`.
 
-- [ ] **Memory cap** (medium priority) — custom allocator returns `nullptr` when usage
+- [x] **Memory cap** (medium priority) — custom allocator returns `nullptr` when usage
   exceeds a configured limit. Lua raises a memory error that `lua_pcall` catches cleanly.
+  Implemented as `set_memory_limit`/`clear_memory_limit`, sharing the same `limited_alloc`
+  allocator as memory tracking above; limit breaches (and genuine system OOM) are also
+  reported via `enable_error_logging`.
 
 - [ ] **Sandboxing** (high priority) — after `luaL_openlibs`, nil out globals scripts must
   never reach:

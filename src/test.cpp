@@ -3158,3 +3158,97 @@ TEST_CASE("hooks integration: call tracing, instruction limit, and depth cap coe
 	REQUIRE_THAT(err2, Catch::Matchers::ContainsSubstring("recursion depth limit"));
 	REQUIRE(events.size() > 0);
 }
+
+// ============================================================
+// memory tracking / limiting
+// ============================================================
+
+TEST_CASE("memory tracking: get_memory_usage reports nonzero usage after construction", "[memory-limit]")
+{
+	Lua lua;
+	// Just constructing a Lua state (luaL_openlibs, print installation, etc.)
+	// already allocates plenty - confirms the custom allocator is actually
+	// wired in and tracking from the very first allocation.
+	REQUIRE(lua.get_memory_usage() > 0);
+}
+
+TEST_CASE("memory tracking: usage increases as script allocates tables/strings", "[memory-limit]")
+{
+	Lua lua;
+	const auto before = lua.get_memory_usage();
+
+	auto [ok, err] = lua.run_script("t = {}\n"
+	                                "for i = 1, 1000 do t[i] = 'some string value ' .. i end\n");
+	REQUIRE(ok);
+	REQUIRE(lua.get_memory_usage() > before);
+}
+
+TEST_CASE("memory limit: allocations beyond the cap raise a catchable error", "[memory-limit]")
+{
+	Lua lua;
+	// Set the cap just above whatever baseline construction already used, so
+	// there's no room left for the script's own table/string allocations.
+	lua.set_memory_limit(lua.get_memory_usage() + 64);
+
+	auto [ok, err] = lua.run_script("t = {}\n"
+	                                "for i = 1, 100000 do t[i] = 'padding string number ' .. i end\n");
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("memory"));
+}
+
+TEST_CASE("memory limit: exceeding the cap is reported via error logging", "[memory-limit]")
+{
+	Lua lua;
+	std::vector<std::string> logged;
+	lua.enable_error_logging([&logged](std::string_view s) { logged.emplace_back(s); });
+	lua.set_memory_limit(lua.get_memory_usage() + 64);
+
+	auto [ok, err] = lua.run_script("t = {}\n"
+	                                "for i = 1, 100000 do t[i] = 'padding string number ' .. i end\n");
+	REQUIRE_FALSE(ok);
+	bool found = false;
+	for(const auto& line : logged)
+	{
+		if(line.find("memory limit exceeded") != std::string::npos)
+		{
+			found = true;
+		}
+	}
+	REQUIRE(found);
+}
+
+TEST_CASE("memory limit: clear_memory_limit removes the cap", "[memory-limit]")
+{
+	Lua lua;
+	lua.set_memory_limit(lua.get_memory_usage() + 64);
+	lua.clear_memory_limit();
+
+	auto [ok, err] = lua.run_script("t = {}\n"
+	                                "for i = 1, 100000 do t[i] = 'padding string number ' .. i end\n");
+	REQUIRE(ok);
+}
+
+TEST_CASE("memory limit: script under the limit succeeds normally", "[memory-limit]")
+{
+	Lua lua;
+	lua.set_memory_limit(64 * 1024 * 1024); // generous cap, well above normal usage
+
+	auto [ok, err] = lua.run_script("x = 1 + 1");
+	REQUIRE(ok);
+	REQUIRE(lua.get_memory_usage() > 0);
+	REQUIRE(lua.get_memory_usage() <= 64 * 1024 * 1024);
+}
+
+TEST_CASE("memory limit: Lua instance remains usable after a memory-limit error", "[memory-limit]")
+{
+	Lua lua;
+	lua.set_memory_limit(lua.get_memory_usage() + 64);
+
+	auto [ok1, err1] = lua.run_script("t = {}\n"
+	                                  "for i = 1, 100000 do t[i] = 'padding string number ' .. i end\n");
+	REQUIRE_FALSE(ok1);
+
+	lua.clear_memory_limit();
+	auto [ok2, err2] = lua.run_script("y = 2 + 2");
+	REQUIRE(ok2);
+}

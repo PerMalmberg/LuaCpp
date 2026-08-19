@@ -7,6 +7,7 @@ extern "C"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <list>
 #include <map>
@@ -165,8 +166,9 @@ class Lua final
   public:
 	Lua()
 	{
-		luaL_openlibs(*this);
 		*static_cast<Lua**>(lua_getextraspace(static_cast<lua_State*>(*this))) = this;
+		lua_atpanic(*this, &Lua::panic);
+		luaL_openlibs(*this);
 		lua_pushcfunction(*this, &Lua::captured_print);
 		lua_setglobal(*this, "print"); // default: print() output goes nowhere
 	}
@@ -362,6 +364,34 @@ class Lua final
 	{
 		hooks.max_depth = 0;
 		refresh_hook_mask();
+	}
+
+	// Enables a memory cap: once total bytes allocated by this Lua instance
+	// (tracked via a custom lua_Alloc - see limited_alloc) would exceed
+	// `bytes`, the allocator refuses the offending allocation by returning
+	// nullptr. Lua treats this exactly like a real out-of-memory condition and
+	// raises a catchable "not enough memory" error (visible via run_script's/
+	// call<>'s {false, msg} return) - it does NOT crash or corrupt the state.
+	// Existing allocations already above the limit are left untouched; only
+	// future allocations that would push usage over the limit are rejected.
+	// Pass 0 to disable the cap (the default - unlimited).
+	void set_memory_limit(std::size_t bytes)
+	{
+		memory.limit = bytes;
+	}
+
+	void clear_memory_limit()
+	{
+		memory.limit = 0;
+	}
+
+	// Total bytes currently allocated by this Lua instance's custom allocator
+	// (i.e. everything Lua itself has allocated - state, strings, tables,
+	// closures, etc. - not just script-visible data). Always tracked, whether
+	// or not a memory limit is set.
+	std::size_t get_memory_usage() const
+	{
+		return memory.bytes_used;
 	}
 
 	std::tuple<bool, std::string> run_script(const char* script)
@@ -735,6 +765,17 @@ class Lua final
 	// or require the other.
 	LuaErrorLogCallback error_log_callback;
 
+	// Backs set_memory_limit/get_memory_usage - see limited_alloc. Declared
+	// here (before `state`, further down) so it is already default-constructed
+	// by the time state's own member initializer calls lua_newstate(), which
+	// immediately makes allocator calls through limited_alloc with ud == this.
+	struct MemoryState
+	{
+		std::size_t bytes_used = 0;
+		std::size_t limit = 0; // 0 = unlimited (default)
+	};
+	MemoryState memory;
+
 	// Recomputes the requested LUA_MASKCOUNT period as the minimum of whatever
 	// instruction-counting and instruction-limit each currently want, since
 	// lua_sethook only supports one count period per lua_State. Passing 0
@@ -946,6 +987,83 @@ class Lua final
 		return 0;
 	}
 
+	// Custom lua_Alloc used in place of Lua's default allocator (l_alloc), so
+	// every allocation/reallocation/free can be tracked and, optionally,
+	// capped via set_memory_limit(). `ud` is the owning Lua* (passed to
+	// lua_newstate as the userdata argument in the constructor).
+	//
+	// Per the lua_Alloc manual entry: when `ptr` is nullptr, `osize` is NOT a
+	// real byte count - it's a type tag (e.g. LUA_TSTRING) identifying what
+	// kind of object is being allocated for the first time. Only `osize` is
+	// meaningful as a byte count when `ptr` is non-null (a real, previously-
+	// tracked allocation is being resized or freed).
+	static void* limited_alloc(void* ud, void* ptr, std::size_t osize, std::size_t nsize)
+	{
+		auto* self = static_cast<Lua*>(ud);
+		const std::size_t old_size = ptr ? osize : 0;
+
+		if(nsize == 0)
+		{
+			std::free(ptr);
+			self->memory.bytes_used -= old_size;
+			return nullptr;
+		}
+
+		if(self->memory.limit > 0)
+		{
+			const std::size_t projected = self->memory.bytes_used - old_size + nsize;
+			if(projected > self->memory.limit)
+			{
+				// Rejecting here makes Lua treat this exactly like a real
+				// out-of-memory condition: it raises a catchable "not enough
+				// memory" error that lua_pcall (run_script/call<>) reports via
+				// the usual {false, msg} tuple - the existing allocation at
+				// `ptr` (if any) is left untouched and still valid.
+				self->log_error("memory limit exceeded: refused allocation of " + std::to_string(nsize) +
+				                " byte(s) (limit " + std::to_string(self->memory.limit) + ", currently " +
+				                std::to_string(self->memory.bytes_used) + " byte(s) in use)");
+				return nullptr;
+			}
+		}
+
+		void* new_ptr = std::realloc(ptr, nsize);
+		if(!new_ptr)
+		{
+			// Genuine system OOM, not our own cap - still logged for visibility.
+			self->log_error("memory allocation failed: system out of memory (requested " + std::to_string(nsize) +
+			                " byte(s))");
+			return nullptr;
+		}
+
+		self->memory.bytes_used = self->memory.bytes_used - old_size + nsize;
+		return new_ptr;
+	}
+
+	// Replaces the panic handler luaL_newstate would otherwise install (we use
+	// lua_newstate + our own limited_alloc instead of luaL_newstate, so that
+	// default handler is never installed automatically). Mirrors Lua's own
+	// default panic behaviour (report the unprotected error) but routes the
+	// message through log_error instead of writing directly to stderr. Only
+	// fires for errors raised with no lua_pcall protection anywhere on the
+	// call stack - should not normally trigger, since run_script/call<> always
+	// go through lua_pcall.
+	static int panic(lua_State* L)
+	{
+		auto* self = *static_cast<Lua**>(lua_getextraspace(L));
+
+		const char* msg = lua_tostring(L, -1);
+		if(!msg)
+		{
+			msg = "error object is not a string";
+		}
+
+		if(self)
+		{
+			self->log_error(std::string("PANIC: unprotected error in call to Lua API (") + msg + ")");
+		}
+		return 0;
+	}
+
 	// Builds the typed trampoline closure shared by both expose_func overloads.
 	// `keep_alive` is captured by value inside the closure purely to extend the
 	// lifetime of an owning object that `func`'s captures may reference; it is
@@ -1081,7 +1199,13 @@ class Lua final
 	// called more than once. See close() for the full rationale.
 	bool closed = false;
 
-	LuaStatePtr state{luaL_newstate(), [](lua_State* L) { lua_close(L); }};
+	// Uses lua_newstate (not luaL_newstate) with limited_alloc as the custom
+	// allocator and `this` as its userdata, so every allocation is tracked and
+	// optionally capped via set_memory_limit(). This is why the constructor
+	// installs the panic handler itself (see Lua()) instead of relying on
+	// luaL_newstate's automatic one.
+	LuaStatePtr state{lua_newstate(&Lua::limited_alloc, this, luaL_makeseed(nullptr)),
+	                  [](lua_State* L) { lua_close(L); }};
 
 	// ---------------------------------------------------------------------------
 	// Stack I/O - static so they work both from instance methods and from inside

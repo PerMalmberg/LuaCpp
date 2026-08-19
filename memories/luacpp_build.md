@@ -540,6 +540,81 @@ accordingly, and fixed/renamed the test that used to assert
 "messages are prefixed and NOT newline-terminated". Full suite still
 210/210 after the change.
 
+## Implemented: Memory tracking (get_memory_usage) + Memory cap
+## (set_memory_limit/clear_memory_limit)
+
+Switched Lua's `state` member from `luaL_newstate()` to `lua_newstate(&Lua::
+limited_alloc, this, luaL_makeseed(nullptr))` - a custom `lua_Alloc` with
+`this` as the userdata, so every Lua allocation/reallocation/free is
+tracked, and can optionally be capped.
+
+**Lua 5.5 API change caught here**: `lua_newstate` now takes a THIRD
+parameter, `unsigned seed` (not just `lua_Alloc f, void *ud` like older Lua
+versions) - compiling with only 2 args fails with "no matching function".
+`luaL_newstate()` internally calls
+`lua_newstate(luaL_alloc, NULL, luaL_makeseed(NULL))` - so
+`luaL_makeseed(nullptr)` is the right thing to pass for the seed to match
+default behavior (it ignores its `lua_State*` argument entirely and is
+safe to call with `nullptr`/before any state exists).
+
+**Member ordering matters again** (same lesson as the hooks work): a new
+`MemoryState { std::size_t bytes_used = 0; std::size_t limit = 0; } memory;`
+member MUST be declared physically BEFORE `LuaStatePtr state{...}` in the
+class body, since C++ constructs members in declaration order and
+`state`'s own initializer calls `lua_newstate()` immediately, which makes
+allocator calls through `limited_alloc(ud=this, ...)` before the
+constructor body even starts - `memory` must already be default-
+constructed (zero) by then, or it's UB to touch it. Same applies to
+`error_log_callback` (already positioned before `state` from the earlier
+hooks work) since `limited_alloc` calls `self->log_error(...)` on cap
+breach / real OOM.
+
+**`limited_alloc` allocator semantics** (implements the `lua_Alloc`
+contract from the manual): when `ptr == nullptr`, `osize` is NOT a real
+byte count - it's a type tag (e.g. `LUA_TSTRING`) for a brand-new
+allocation, so it must be ignored for bookkeeping (`old_size = ptr ? osize
+: 0`). `nsize == 0` means free (return nullptr, decrement bytes_used by
+old_size). Otherwise: if a limit is set and `bytes_used - old_size + nsize
+> limit`, reject (return nullptr, log via log_error) WITHOUT touching the
+existing block at `ptr` - Lua treats a nullptr return here exactly like a
+real out-of-memory condition and raises a catchable "not enough memory"
+error via the normal lua_pcall path (run_script/call<> return {false,
+msg}), with the existing allocation left valid. Otherwise realloc(ptr,
+nsize); if that itself returns nullptr (genuine system OOM) also log and
+return nullptr; otherwise update bytes_used and return the new pointer.
+
+**Lost the default panic handler**: `luaL_newstate()` automatically calls
+`lua_atpanic(L, &panic)` with Lua's own default panic function (prints to
+stderr). Switching to raw `lua_newstate()` means that's no longer
+installed automatically - had to add our own `static int panic(lua_State*
+L)` (recovers `Lua*` via `lua_getextraspace`, mirrors the default's
+behavior/message format but routes through `log_error` instead of stderr)
+and call `lua_atpanic(*this, &Lua::panic)` explicitly in the constructor.
+Reordered the constructor to set `lua_getextraspace` and call
+`lua_atpanic` BEFORE `luaL_openlibs`/installing `print`, so the panic
+handler and allocator's `self` lookups are valid from the very first
+moment anything could go wrong.
+
+Public API added:
+- `set_memory_limit(std::size_t bytes)` / `clear_memory_limit()` - 0 (the
+  default) means unlimited.
+- `get_memory_usage() const` - always tracked, independent of whether a
+  limit is set.
+
+Added 7 new tests (`[memory-limit]` tag): baseline usage > 0 right after
+construction (proves the custom allocator is actually wired in), usage
+increases as a script allocates tables/strings, a tight cap set relative
+to `get_memory_usage() + small_slack` causes a large allocation to fail
+with a catchable "not enough memory" error, the failure is also reported
+via `enable_error_logging` (message contains "memory limit exceeded"),
+`clear_memory_limit` removes the cap, a generous cap doesn't interfere
+with normal scripts, and the `Lua` instance remains fully usable for
+subsequent scripts after a memory-limit error (matches the same
+"protection doesn't corrupt state" pattern already established for
+instruction-limit/recursion-depth-cap). Full suite now 217/217 passing.
+Also manually verified `luacpp_example` still runs end-to-end (exit code
+0) after switching the underlying allocator/panic-handler wiring.
+
 ## Status as of last update
 Simplified to single-unity-TU + /EHa fix, WITHOUT LUA_USE_LONGJMP (Lua
 uses native C++ exceptions for error handling). Verified locally on
