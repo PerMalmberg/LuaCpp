@@ -325,10 +325,10 @@ class Lua final
 		              "expose_method: StructType must be registered with LUA_REGISTER_STRUCT");
 
 		auto wrapper = make_method_wrapper<StructType, ReturnTypes...>(std::move(func), NoOwner{});
-		LuaFunc* fn_ptr = wrapper.get();
-		registered_funcs.push_back(std::move(wrapper));
+		std::shared_ptr<LuaFunc> fn(std::move(wrapper));
+		registered_funcs.push_back(fn);
 
-		add_method_to_registry<StructType>(*this, name, fn_ptr);
+		add_method_to_registry<StructType>(*this, name, fn);
 	}
 
 	// Same as expose_method above, but keeps `owner` alive for as long as the
@@ -344,10 +344,10 @@ class Lua final
 		              "expose_method: StructType must be registered with LUA_REGISTER_STRUCT");
 
 		auto wrapper = make_method_wrapper<StructType, ReturnTypes...>(std::move(func), std::move(owner));
-		LuaFunc* fn_ptr = wrapper.get();
-		registered_funcs.push_back(std::move(wrapper));
+		std::shared_ptr<LuaFunc> fn(std::move(wrapper));
+		registered_funcs.push_back(fn);
 
-		add_method_to_registry<StructType>(*this, name, fn_ptr);
+		add_method_to_registry<StructType>(*this, name, fn);
 	}
 
 	// Registers a C++ callable as a named mutating method on all Lua instances of StructType.
@@ -427,10 +427,10 @@ class Lua final
 			}
 		});
 
-		registered_funcs.push_back(std::move(wrapper));
-		LuaFunc* fn_ptr = registered_funcs.back().get();
+		std::shared_ptr<LuaFunc> fn(std::move(wrapper));
+		registered_funcs.push_back(fn);
 
-		add_method_to_registry<StructType>(*this, name, fn_ptr);
+		add_method_to_registry<StructType>(*this, name, fn);
 	}
 
   private:
@@ -486,16 +486,17 @@ class Lua final
 		});
 	}
 
-	// Transfers ownership of `wrapper` into registered_funcs and registers the
-	// resulting trampoline closure as a Lua global named `name`.
+	// Transfers ownership of `wrapper` into registered_funcs (as a shared_ptr)
+	// and registers a trampoline closure holding a weak_ptr to it as a Lua
+	// global named `name` - see push_weak_upvalue for the rationale.
 	void register_global_func(const char* name, std::unique_ptr<LuaFunc> wrapper)
 	{
 		// Transfer ownership before touching the Lua stack so that an allocation
 		// failure leaves Lua's state untouched.
-		registered_funcs.push_back(std::move(wrapper));
-		LuaFunc* fn_ptr = registered_funcs.back().get();
+		std::shared_ptr<LuaFunc> fn(std::move(wrapper));
+		registered_funcs.push_back(fn);
 
-		lua_pushlightuserdata(*this, fn_ptr);
+		push_weak_upvalue(*this, fn);
 		lua_pushcclosure(*this, &Lua::trampoline, 1);
 		lua_setglobal(*this, name);
 	}
@@ -556,13 +557,15 @@ class Lua final
 		return state.get();
 	}
 
-	// Owns the typed wrapper objects whose raw pointers are stored as Lua
-	// upvalues. Declared before state so it is destroyed after lua_close(),
-	// ensuring no dangling LuaFunc* pointers exist while the state is live.
-	// std::list is used instead of std::vector so that push_back never
-	// reallocates: the raw fn_ptr stored as a Lua upvalue must remain stable
-	// for the lifetime of the Lua state.
-	std::list<std::unique_ptr<LuaFunc>> registered_funcs;
+	// Owns the shared references to registered LuaFunc trampolines. Declared
+	// before state so it is destroyed after lua_close(). Stored as shared_ptr
+	// (not unique_ptr) because the Lua closure itself only holds a
+	// std::weak_ptr<LuaFunc> upvalue (see push_weak_upvalue / trampoline): if a
+	// stale closure ever survives past this container's own destruction (e.g.
+	// a coroutine resumed after teardown - see LIFETIME.md item 5), calling it
+	// observes an expired weak_ptr and raises a catchable Lua error instead of
+	// dereferencing freed memory.
+	std::list<std::shared_ptr<LuaFunc>> registered_funcs;
 
 	LuaStatePtr state{luaL_newstate(), [](lua_State* L) { lua_close(L); }};
 
@@ -820,29 +823,79 @@ class Lua final
 	// ---------------------------------------------------------------------------
 
 	// Non-capturing lua_CFunction used as the trampoline for both expose_func and
-	// expose_method closures. Reads a LuaFunc* from upvalue slot 1, invokes it,
-	// and converts any C++ exception into a Lua error after all C++ objects on
-	// this frame are destroyed (safe for Lua's longjmp-based error protocol).
+	// expose_method/expose_mutable_method closures. Reads a std::weak_ptr<LuaFunc>
+	// from upvalue slot 1 (a full userdata, not light userdata - see
+	// push_weak_upvalue) and attempts to lock() it before calling. If the
+	// referenced LuaFunc no longer exists the weak_ptr is expired and a
+	// catchable Lua error is raised instead of dereferencing freed memory.
+	// Any C++ exception thrown by the callable itself is likewise converted
+	// into a Lua error after all C++ objects on this frame are destroyed
+	// (safe for Lua's longjmp-based error protocol).
 	static int trampoline(lua_State* L)
 	{
-		auto* fn = static_cast<LuaFunc*>(lua_touserdata(L, lua_upvalueindex(1)));
+		auto* weak = static_cast<std::weak_ptr<LuaFunc>*>(lua_touserdata(L, lua_upvalueindex(1)));
+		auto fn = weak->lock();
 		bool has_error = false;
 		int nret = 0;
-		try
+		if(!fn)
 		{
-			nret = (*fn)(L);
-		}
-		catch(const std::exception& e)
-		{
-			lua_pushstring(L, e.what()); // copy message into Lua before unwinding
+			lua_pushstring(L, "stale function reference: the registered C++ callable no longer exists");
 			has_error = true;
 		}
+		else
+		{
+			try
+			{
+				nret = (*fn)(L);
+			}
+			catch(const std::exception& e)
+			{
+				lua_pushstring(L, e.what()); // copy message into Lua before unwinding
+				has_error = true;
+			}
+		}
+		// lua_error() below performs a longjmp that does NOT run C++ destructors
+		// for anything still on this stack frame. fn is a std::shared_ptr (a
+		// non-trivial destructor) captured from weak->lock(), so it must be
+		// released explicitly here - otherwise a Lua error would silently leak
+		// one reference to the LuaFunc on every failing call.
+		fn.reset();
 		// All C++ objects are destroyed here; safe to longjmp.
 		if(has_error)
 		{
 			return lua_error(L);
 		}
 		return nret;
+	}
+
+	// GC metamethod for the weak upvalue userdata created by push_weak_upvalue.
+	// Destroys the std::weak_ptr<LuaFunc> in place; the pointee LuaFunc itself
+	// (if still alive) is owned independently by registered_funcs and is
+	// unaffected by this.
+	static int weak_upvalue_gc(lua_State* L)
+	{
+		auto* weak = static_cast<std::weak_ptr<LuaFunc>*>(lua_touserdata(L, 1));
+		weak->~weak_ptr<LuaFunc>();
+		return 0;
+	}
+
+	// Pushes a full-userdata upvalue holding a std::weak_ptr<LuaFunc> referring
+	// to `fn`. Full userdata (with a __gc metamethod) is used instead of light
+	// userdata so the upvalue never holds a raw pointer into registered_funcs:
+	// if the LuaFunc is ever destroyed while a stale closure is still
+	// reachable from Lua, trampoline() observes the expired weak_ptr and
+	// raises a catchable Lua error instead of dereferencing freed memory.
+	static void push_weak_upvalue(lua_State* L, const std::shared_ptr<LuaFunc>& fn)
+	{
+		void* mem = lua_newuserdatauv(L, sizeof(std::weak_ptr<LuaFunc>), 0);
+		new(mem) std::weak_ptr<LuaFunc>(fn);
+
+		if(luaL_newmetatable(L, "LuaCpp.WeakLuaFunc")) // created once per lua_State
+		{
+			lua_pushcfunction(L, &Lua::weak_upvalue_gc);
+			lua_setfield(L, -2, "__gc");
+		}
+		lua_setmetatable(L, -2);
 	}
 
 	// Returns a unique void* identifying type T in the Lua registry.
@@ -856,10 +909,11 @@ class Lua final
 	}
 
 	// Looks up (or creates) the per-type metatable for T in the Lua registry and
-	// adds a trampoline closure for fn_ptr to its __index sub-table under `name`.
+	// adds a trampoline closure holding a weak_ptr to `fn` to its __index
+	// sub-table under `name` - see push_weak_upvalue for the rationale.
 	// Leaves the Lua stack balanced.
 	template <typename T>
-	static void add_method_to_registry(lua_State* L, const char* name, LuaFunc* fn_ptr)
+	static void add_method_to_registry(lua_State* L, const char* name, const std::shared_ptr<LuaFunc>& fn)
 	{
 		lua_pushlightuserdata(L, const_cast<void*>(get_type_key<T>()));
 		lua_rawget(L, LUA_REGISTRYINDEX); // push metatable or nil
@@ -895,7 +949,7 @@ class Lua final
 			throw std::runtime_error(std::string("method '") + name + "' is already registered on this type");
 		}
 
-		lua_pushlightuserdata(L, fn_ptr);
+		push_weak_upvalue(L, fn);
 		lua_pushcclosure(L, &Lua::trampoline, 1); // stack: [metatable, __index_table, closure]
 		lua_setfield(L, -2, name); // __index_table[name] = closure
 

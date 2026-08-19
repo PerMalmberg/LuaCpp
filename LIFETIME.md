@@ -38,17 +38,41 @@ before invoking the registered closure).
 
 ## 2. Enforce `Lua` outlives registered callables
 
-**Risk:** Nothing in the API prevents a caller from destroying a C++ object
-whose address was captured by a registered function while the `Lua` instance
-is still alive and the function is still callable from Lua.
+**Status: Implemented (infrastructure).** `registered_funcs` now stores
+`std::shared_ptr<LuaFunc>` (previously `std::unique_ptr`). Every Lua closure
+created by `expose_func`/`expose_method`/`expose_mutable_method` no longer
+embeds a raw `LuaFunc*` as a light-userdata upvalue; instead
+`push_weak_upvalue()` stores a `std::weak_ptr<LuaFunc>` inside a full
+userdata (with a `__gc` metamethod that destroys the `weak_ptr` when Lua
+collects it). `trampoline()` calls `weak_ptr::lock()` before invoking the
+callable:
 
-**Plan:** Wrap exposed functions in `std::shared_ptr<LuaFunc>`; store a
-`std::weak_ptr` copy inside the Lua closure (as full userdata with a
-`__gc` metamethod, not a light userdata). The trampoline checks
-`weak_ptr::lock()` before calling; if expired it raises a Lua error instead
-of dereferencing dead memory.
+```cpp
+auto fn = weak->lock();
+if(!fn) { /* raise a catchable Lua error: "stale function reference: ..." */ }
+```
 
-This turns silent UB into a catchable Lua runtime error.
+This turns what would otherwise be silent UB (dereferencing a freed
+`LuaFunc`) into a catchable Lua runtime error, *if* the `shared_ptr` is ever
+released down to zero strong references while a closure referencing it is
+still reachable from Lua. Today, `registered_funcs` (owned by the `Lua`
+instance) is the sole permanent strong owner and nothing currently erases
+entries from it before the `Lua` instance's own destruction, so this path is
+currently unreachable through the public API alone - it is forward-looking
+infrastructure for a future `unregister`/`close()` API (see item 3) or for
+coroutine misuse (see item 5), at which point stale calls will fail loudly
+instead of crashing.
+
+**Bug fixed along the way:** the initial implementation stored the locked
+`shared_ptr` (`auto fn = weak->lock();`) in a local variable that was still
+alive when `trampoline()` called `lua_error()` on a failure path. Since
+`lua_error` performs a `longjmp` that does **not** run C++ destructors for
+objects on the current stack frame, every failing call permanently leaked one
+strong reference to the corresponding `LuaFunc` (confirmed with
+AddressSanitizer/LeakSanitizer). Fixed by explicitly calling `fn.reset()`
+before the `lua_error()` call, restoring the invariant documented at the
+trampoline's `longjmp` point: "All C++ objects are destroyed here; safe to
+longjmp."
 
 ---
 
