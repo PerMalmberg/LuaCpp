@@ -242,6 +242,41 @@ cases / 21 assertions, all passed, with error messages showing e.g.
 `[string "boom(-1)"]:1: negative input not allowed` confirming the
 exception's what() text correctly reaches the Lua-visible error string.
 
+## Reworked main.cpp into a feature showcase + updated README
+
+src/main.cpp was a single ad-hoc script; rewrote it into one demo_*()
+function per LuaCpp feature, all called in sequence from main():
+demo_run_script, demo_assign, demo_call, demo_struct_binding (incl. nested
+struct/Rect + construction from a Lua table literal), demo_expose_func
+(scalar/void/tuple returns + the shared_ptr<Owner> keep-alive overload via
+a "next_id" counter), demo_expose_method, demo_expose_mutable_method,
+demo_exception_handling (throwing std::runtime_error from an expose_func
+callable and showing the Lua state remains usable after), and
+demo_error_handling (syntax error / runtime error() / wrong-arg-count, all
+via the {ok, err} tuple pattern). Each prints a "=== Title ===" header.
+Verified: builds clean, runs end-to-end with exit code 0, all output
+correct; full ctest still 177/177.
+
+Updated README.md to match:
+- Building section: lists the actual 3 targets (lua_static, luacpp_example,
+  luacpp_tests - not the old main/tests names) and documents the new
+  LUACPP_BUILD_EXAMPLES/LUACPP_BUILD_TESTS/LUACPP_ENABLE_ASAN options.
+- New "Using LuaCpp in Your Own Project" section (linked from the TOC)
+  showing FetchContent + target_link_libraries(your_target PRIVATE
+  LuaCpp::LuaCpp), explaining what that interface target bundles
+  (lua_static + include paths + transitive cxx_std_17/EHa) and that
+  LUACPP_BUILD_* defaults to OFF for consumers so there's no target-name
+  collision risk or unwanted Catch2 dependency.
+- New "Exception Handling" API section (linked from TOC) documenting the
+  std::exception -> Lua error behavior, that the Lua state stays usable
+  afterward, that expose_mutable_method leaves self untouched if the
+  exception is thrown before mutation, and that non-std::exception types
+  are NOT caught and will propagate as raw C++ exceptions.
+- expose_func section: added a paragraph + example for the
+  std::shared_ptr<Owner> keep-alive overload, linking to LIFETIME.md.
+No longer mentions "copy Lua.hpp into your project" as the primary
+integration method (superseded by the LuaCpp::LuaCpp CMake target).
+
 ## Other gotchas encountered
 - Lua's headers (lua.h/lauxlib.h/lualib.h) do NOT wrap declarations in
   extern "C" themselves; Lua.hpp already wraps its own #include of them in

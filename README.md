@@ -14,6 +14,7 @@ and from Lua scripts with automatic type checking and clear error messages.
 
 - [Requirements](#requirements)
 - [Building](#building)
+- [Using LuaCpp in Your Own Project](#using-luacpp-in-your-own-project)
 - [Quick Start](#quick-start)
 - [Supported Types](#supported-types)
 - [API](#api)
@@ -24,6 +25,7 @@ and from Lua scripts with automatic type checking and clear error messages.
   - [expose\_func](#expose_func)
   - [expose\_method](#expose_method)
   - [expose\_mutable\_method](#expose_mutable_method)
+  - [Exception Handling](#exception-handling)
 - [Gotchas](#gotchas)
 
 ## Requirements
@@ -42,9 +44,58 @@ ctest --test-dir build -C Release
 Lua 5.5.0 is downloaded and compiled automatically via `FetchContent`; no
 system Lua installation is required.
 
-To use LuaCpp in your own project, copy `src/Lua.hpp` into your source tree,
-build Lua 5.5 (or reuse the `FetchContent` block from this project's
-`CMakeLists.txt`), include the header, and link against the Lua static library.
+Building this repository standalone produces three targets:
+
+| Target | Description |
+| --- | --- |
+| `lua_static` | Lua 5.5, compiled as C++ (see [LIFETIME.md](LIFETIME.md) for the exception-handling rationale). |
+| `luacpp_example` | The feature-showcase executable built from `src/main.cpp` - run it to see every LuaCpp feature exercised end to end. |
+| `luacpp_tests` | The Catch2 test suite, registered with `ctest`. |
+
+The sample executable and test suite are only built when LuaCpp is the
+top-level CMake project (or when explicitly requested - see below); a
+consuming project that pulls LuaCpp in via `add_subdirectory()` gets neither
+by default, avoiding target-name collisions and unnecessary dependencies.
+
+### CMake options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `LUACPP_BUILD_EXAMPLES` | `ON` when top-level, else `OFF` | Build the `luacpp_example` sample executable. |
+| `LUACPP_BUILD_TESTS` | `ON` when top-level, else `OFF` | Fetch Catch2 and build/register the `luacpp_tests` test suite. |
+| `LUACPP_ENABLE_ASAN` | `ON` when top-level, else `OFF` | Enable AddressSanitizer for `luacpp_tests` (non-MSVC only). |
+
+## Using LuaCpp in Your Own Project
+
+LuaCpp is designed to be pulled straight into a larger CMake project:
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(LuaCpp GIT_REPOSITORY https://github.com/PerMalmberg/LuaCpp.git GIT_TAG main)
+FetchContent_MakeAvailable(LuaCpp)
+
+target_link_libraries(your_target PRIVATE LuaCpp::LuaCpp)
+```
+
+(`add_subdirectory(path/to/LuaCpp)` works identically if you vendor the
+source instead of fetching it.)
+
+`LuaCpp::LuaCpp` is an interface target that bundles everything a consumer
+needs:
+
+- The compiled `lua_static` library and its include path (so `#include
+  <lua.h>`-family headers resolve).
+- `src/`, so `#include "Lua.hpp"` resolves.
+- The C++17 requirement (`cxx_std_17`) and, on MSVC, the `/EHa` exception
+  model that Lua's C++ exception-based error handling requires - both
+  propagate transitively to your target automatically; you don't need to
+  set them yourself.
+
+LuaCpp's own `LUACPP_BUILD_EXAMPLES`/`LUACPP_BUILD_TESTS` options default to
+`OFF` in this scenario, so no Catch2 dependency, test binary, or sample
+executable is added to your build - and target names like `main`/`tests` in
+your own project won't collide with anything LuaCpp defines internally
+(its own targets are named `luacpp_example`/`luacpp_tests`).
 
 ## Quick Start
 
@@ -74,7 +125,7 @@ lua.run_script("assert(add(3, 4) == 7)");
 ## Supported Types
 
 | C++ type | Lua type | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `bool` | boolean | Native Lua boolean. |
 | `int`, `long` | integer | |
 | `float`, `double` | number | |
@@ -255,6 +306,20 @@ lua.expose_func<Point>("midpoint",
     }));
 ```
 
+If the callable's captures reference an object that might be destroyed before
+the `Lua` instance (e.g. a reference into a `Sensor` owned elsewhere), use the
+`std::shared_ptr<Owner>` overload instead of a plain lambda capture - it keeps
+`owner` alive for as long as the registered closure exists:
+
+```cpp
+auto sensor = std::make_shared<Sensor>();
+lua.expose_func<int>("read_sensor", sensor,
+    std::function<int()>([raw = sensor.get()] { return raw->read(); }));
+```
+
+The same overload exists for `expose_method`. See [LIFETIME.md](LIFETIME.md)
+for the full rationale and the invariants this relies on.
+
 ---
 
 ### expose_method
@@ -333,6 +398,42 @@ added to the Lua table by Lua code are left untouched.
 
 > **Note:** same registration-timing rule as `expose_method` - register before
 > pushing instances.
+
+---
+
+### Exception Handling
+
+Any C++ exception deriving from `std::exception`, thrown from inside a
+callable registered via `expose_func`, `expose_method`, or
+`expose_mutable_method`, is caught automatically and turned into a Lua error
+carrying the exception's `what()` message. It never crashes the process or
+leaves the `Lua` instance in a broken state - the next call succeeds
+normally.
+
+```cpp
+lua.expose_func<int>("safe_div",
+    std::function<int(int, int)>([](int a, int b) {
+        if (b == 0)
+            throw std::runtime_error("division by zero");
+        return a / b;
+    }));
+
+auto [ok, err] = lua.run_script("safe_div(1, 0)");
+// ok == false, err contains "division by zero"
+
+auto [ok2, err2, r] = lua.call<int>("safe_div", 10, 2);
+// ok2 == true, r == 5 - the Lua state is fully usable after the earlier error
+```
+
+For `expose_mutable_method`, an exception thrown before any field of `self`
+is mutated leaves the Lua-side table completely untouched (no partial
+write-back occurs, since write-back only happens after the callable returns
+normally).
+
+Exceptions that do **not** derive from `std::exception` are not caught by
+LuaCpp and will propagate out of `run_script`/`call`/`expose_*` as a raw C++
+exception - catch it yourself at the call site if that's a possibility for
+your callables.
 
 ---
 
