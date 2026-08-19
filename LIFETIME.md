@@ -63,16 +63,30 @@ infrastructure for a future `unregister`/`close()` API (see item 3) or for
 coroutine misuse (see item 5), at which point stale calls will fail loudly
 instead of crashing.
 
-**Bug fixed along the way:** the initial implementation stored the locked
-`shared_ptr` (`auto fn = weak->lock();`) in a local variable that was still
-alive when `trampoline()` called `lua_error()` on a failure path. Since
-`lua_error` performs a `longjmp` that does **not** run C++ destructors for
-objects on the current stack frame, every failing call permanently leaked one
-strong reference to the corresponding `LuaFunc` (confirmed with
-AddressSanitizer/LeakSanitizer). Fixed by explicitly calling `fn.reset()`
-before the `lua_error()` call, restoring the invariant documented at the
-trampoline's `longjmp` point: "All C++ objects are destroyed here; safe to
-longjmp."
+**Historical bug (no longer applicable):** the initial implementation stored
+the locked `shared_ptr` (`auto fn = weak->lock();`) in a local variable that
+was still alive when `trampoline()` called `lua_error()` on a failure path.
+Back when Lua's error handling used raw `setjmp`/`longjmp` (either via
+`LUA_USE_LONGJMP` or a non-C++ build), `lua_error`'s `longjmp` did **not** run
+C++ destructors for objects on the current stack frame, so every failing call
+permanently leaked one strong reference to the corresponding `LuaFunc`
+(confirmed with AddressSanitizer/LeakSanitizer at the time). This was
+temporarily fixed by splitting the trampoline into `trampoline_impl()` +
+`trampoline()`, ensuring `lua_error()` was only ever called from a frame with
+no live C++ objects/`try`-`catch`.
+
+That split has since been **removed** now that:
+1. Lua is compiled as C++ *without* `LUA_USE_LONGJMP`, so `lua_error()`
+   propagates via a genuine C++ exception (`throw(lua_longjmp*)` in `ldo.c`)
+   instead of `longjmp` - a real C++ throw always unwinds correctly and runs
+   destructors, regardless of which frames it passes through.
+2. MSVC is built with `/EHa` instead of the default `/EHsc` project-wide (see
+   `CMakeLists.txt`), which independently makes even a hypothetical raw
+  `longjmp` safe to unwind across a `try`/`catch` frame.
+
+`trampoline()` now calls `luaL_error()` directly from within its own
+`try`/`catch(const std::exception&)` block; see the comment on `trampoline()`
+in `Lua.hpp` for the up-to-date rationale.
 
 ---
 

@@ -62,44 +62,45 @@ list(REMOVE_ITEM LUA_SOURCES
 # they never see an extern "C" block, causing linker errors against code
 # that consumes the C-linkage declarations.
 #
-# We generate one tiny wrapper .cpp PER Lua source file (rather than a single
-# unity/amalgamated translation unit). Each wrapper just does:
-#   extern "C" { #include "<file>.c" }
-# This keeps every file compiled as its own separate translation unit, just
-# like upstream Lua's normal build - which matters because merging all the
-# sources into one giant TU lets the optimizer inline/analyze *across*
-# former file boundaries. That can expose the classic (and otherwise latent)
-# setjmp/longjmp pitfall where non-volatile locals modified after setjmp()
-# have indeterminate values after a longjmp, particularly under
-# optimization - which is exactly what was crashing (STATUS_HEAP_CORRUPTION)
-# on MSVC in the error-handling code paths (luaL_error / lua_error) once
-# everything was amalgamated into a single translation unit.
+# We generate a single unity/amalgamated wrapper .cpp that #includes every
+# Lua .c source inside one `extern "C" { ... }` block. This was originally
+# suspected of causing Windows STATUS_HEAP_CORRUPTION crashes in Lua's
+# error-handling tests (luaL_error / longjmp paths), and was replaced with
+# one wrapper-per-source-file as a workaround. That turned out to be a red
+# herring: the actual cause was MSVC's default /EHsc exception model being
+# unsafe to mix with setjmp/longjmp (see the /EHa fix above). With /EHa in
+# place, the simple single-TU approach below builds and passes all tests
+# reliably on Windows, Linux and macOS, so we keep it for its simplicity.
 set(LUA_CXX_WRAPPER_DIR "${CMAKE_BINARY_DIR}/generated/lua_cxx")
 file(MAKE_DIRECTORY ${LUA_CXX_WRAPPER_DIR})
 
-set(LUA_CXX_WRAPPERS "")
+set(_wrapper "${LUA_CXX_WRAPPER_DIR}/lua_cxx_unity.cpp")
+set(_wrapper_content "// Auto-generated: compiles all Lua .c sources as one C++ TU with C linkage.\nextern \"C\" {\n")
 foreach(_lua_src IN LISTS LUA_SOURCES)
-  get_filename_component(_lua_src_name "${_lua_src}" NAME_WE)
-  set(_wrapper "${LUA_CXX_WRAPPER_DIR}/${_lua_src_name}_cxx.cpp")
-  file(WRITE "${_wrapper}" "// Auto-generated: compiles ${_lua_src_name}.c as C++ with C linkage.\nextern \"C\" {\n#include \"${_lua_src}\"\n}\n")
-  list(APPEND LUA_CXX_WRAPPERS "${_wrapper}")
+  string(APPEND _wrapper_content "#include \"${_lua_src}\"\n")
 endforeach()
+string(APPEND _wrapper_content "}\n")
+file(WRITE "${_wrapper}" "${_wrapper_content}")
 
-add_library(lua_static STATIC ${LUA_CXX_WRAPPERS})
-set_source_files_properties(${LUA_CXX_WRAPPERS} PROPERTIES LANGUAGE CXX)
+add_library(lua_static STATIC "${_wrapper}")
+set_source_files_properties("${_wrapper}" PROPERTIES LANGUAGE CXX)
 
 target_include_directories(lua_static PUBLIC ${LUA_SRC_DIR})
 
 # Lua's ldo.c auto-selects its error-propagation mechanism based on whether
 # it detects a C++ compiler: when __cplusplus is defined it switches from
 # setjmp/longjmp to throwing/catching a raw `lua_longjmp*` as a C++
-# exception. That mode is not something the unmodified Lua C sources are
-# designed/tested for (no RAII, raw buffer/realloc management throughout),
-# and it has been observed to corrupt the heap on error paths under MSVC's
-# exception model (STATUS_HEAP_CORRUPTION / 0xc0000374). Force Lua back to
-# its classic, battle-tested setjmp/longjmp error handling even though the
-# sources are compiled as C++.
-target_compile_definitions(lua_static PRIVATE LUA_USE_LONGJMP)
+# exception (LUAI_THROW/LUAI_TRY -> throw/catch(...) at the lua_pcall
+# boundary). This is Lua's own documented/supported mechanism for
+# embedding in C++ and, unlike raw longjmp, properly unwinds the C++ stack
+# and runs destructors. We previously forced classic setjmp/longjmp via
+# LUA_USE_LONGJMP because of Windows STATUS_HEAP_CORRUPTION crashes - but
+# those crashes were actually caused by MSVC's /EHsc exception model being
+# incompatible with longjmp (see the /EHa fix above), not by the C++
+# exception mode itself. Now that /EHa is applied project-wide, Lua's
+# native C++ exception-based error handling works reliably (verified with
+# repeated Release and Debug ctest runs on Windows with no flakiness).
+# (Intentionally NOT setting LUA_USE_LONGJMP here.)
 
 # Platform-specific Lua defines and system libraries.
 # lua.c (the interactive REPL) is excluded from the build so LUA_USE_READLINE

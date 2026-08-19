@@ -199,8 +199,9 @@ class Lua final
 			return {false, "Not a function: " + std::string(func), ReturnTypes{}...};
 		}
 
-		(push(state.get(), decay_for_push(std::forward<Args>(args))),
-		 ...); // C++17 fold expression to push all arguments onto the Lua stack
+		(
+		push(state.get(), decay_for_push(std::forward<Args>(args))),
+		...); // C++17 fold expression to push all arguments onto the Lua stack
 
 		const auto arg_count = static_cast<int>(sizeof...(Args));
 		const auto ret_count = static_cast<int>(sizeof...(ReturnTypes));
@@ -824,81 +825,42 @@ class Lua final
 	// Struct method dispatch
 	// ---------------------------------------------------------------------------
 
-	// Does the actual call + exception handling. Contains a try/catch, so this
-	// frame must NEVER call lua_error()/longjmp itself: on MSVC, C++ exception
-	// handling is implemented via SEH, and a longjmp that unwinds past a frame
-	// which registered a try/catch handler corrupts the thread's SEH handler
-	// chain - even though the catch has already run to completion. This does
-	// not crash immediately; it silently breaks stack/error handling for
-	// later, unrelated Lua calls on the same thread (observed as later calls
-	// failing on Windows CI only, since gcc/Linux's exception ABI tolerates
-	// it). Returns normally in all cases; the caller (trampoline) is the one
-	// that may call lua_error(), from a frame with no C++ EH handler of its
-	// own.
+	// Non-capturing lua_CFunction used as the trampoline for both expose_func
+	// and expose_method/expose_mutable_method closures.
 	//
 	// Reads a std::weak_ptr<LuaFunc> from upvalue slot 1 (a full userdata, not
 	// light userdata - see push_weak_upvalue) and attempts to lock() it before
 	// calling. If the referenced LuaFunc no longer exists the weak_ptr is
-	// expired and an error is reported via err_msg instead of dereferencing
-	// freed memory.
-	static int trampoline_impl(lua_State* L, std::weak_ptr<LuaFunc>* weak, std::string& err_msg)
+	// expired and a Lua error is raised instead of dereferencing freed memory.
+	//
+	// Calling lua_error()/luaL_error() directly from within this try/catch
+	// frame is safe: Lua is compiled as C++ WITHOUT LUA_USE_LONGJMP, so
+	// lua_error() propagates via a genuine C++ exception (`throw(lua_longjmp*)`
+	// in ldo.c) rather than a raw longjmp. A real C++ throw correctly unwinds
+	// this frame - including running fn's destructor - and is safe to
+	// propagate through an unrelated try/catch(const std::exception&) block
+	// regardless of the compiler's exception model (/EHsc or /EHa). This used
+	// to be split into trampoline()/trampoline_impl()/call_impl() to keep
+	// lua_error() out of any frame with a live try/catch, back when Lua used
+	// setjmp/longjmp for errors and MSVC's default /EHsc made longjmp-across-
+	// try/catch corrupt the SEH handler chain. Neither condition applies
+	// anymore (see the /EHa fix and the removal of LUA_USE_LONGJMP elsewhere
+	// in this file/CMakeLists.txt), so the split was removed.
+	static int trampoline(lua_State* L)
 	{
+		auto* weak = static_cast<std::weak_ptr<LuaFunc>*>(lua_touserdata(L, lua_upvalueindex(1)));
 		auto fn = weak->lock();
 		if(!fn)
-		{
-			err_msg = "stale function reference: the registered C++ callable no longer exists";
-			return -1;
-		}
+			return luaL_error(L, "stale function reference: the registered C++ callable no longer exists");
+
 		try
 		{
 			return (*fn)(L);
 		}
 		catch(const std::exception& e)
 		{
-			err_msg = e.what();
-			return -1;
+			return luaL_error(L, "%s", e.what());
 		}
-		// fn (a std::shared_ptr) is destroyed here via normal C++ return - no
-		// longjmp involved in this frame, so this is always safe.
-	}
-
-	// Non-capturing lua_CFunction used as the trampoline for both expose_func
-	// and expose_method/expose_mutable_method closures. Delegates to
-	// trampoline_impl() for the actual call and exception handling, and only
-	// calls lua_error() here, in a frame with no C++ try/catch of its own -
-	// see trampoline_impl for why that split matters.
-	static int trampoline(lua_State* L)
-	{
-		auto* weak = static_cast<std::weak_ptr<LuaFunc>*>(lua_touserdata(L, lua_upvalueindex(1)));
-		// err_msg/nret are trivially destructible (int, and a string that is
-		// fully consumed - pushed to Lua - before any possible longjmp), so
-		// nothing of interest is skipped by lua_error()'s longjmp below.
-		// err_msg itself is scoped inside call_impl() so its (non-trivial)
-		// destructor always runs via normal return, never across a longjmp.
-		int nret;
-		const bool has_error = call_impl(L, weak, nret);
-		if(has_error)
-		{
-			return lua_error(L); // error message already pushed onto the Lua stack
-		}
-		return nret;
-	}
-
-	// Pushes the error message (if any) onto the Lua stack itself, so the
-	// std::string holding it is destroyed here - via normal return - before
-	// trampoline() potentially calls lua_error()/longjmp. Returns true if an
-	// error was pushed (message on top of stack), false if nret holds the
-	// real return count.
-	static bool call_impl(lua_State* L, std::weak_ptr<LuaFunc>* weak, int& nret)
-	{
-		std::string err_msg;
-		nret = trampoline_impl(L, weak, err_msg);
-		if(nret < 0)
-		{
-			lua_pushlstring(L, err_msg.data(), err_msg.size());
-			return true;
-		}
-		return false;
 	}
 
 	// GC metamethod for the weak upvalue userdata created by push_weak_upvalue.
