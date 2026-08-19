@@ -461,7 +461,7 @@ TEST_CASE("expose_func: shared_ptr owner survives after local shared_ptr is rese
 		// `counter` goes out of scope here; the closure's own shared_ptr copy
 		// keeps the int alive.
 	}
-auto [ok, err] = lua.run_script("bump(); bump()");
+	auto [ok, err] = lua.run_script("bump(); bump()");
 	REQUIRE(ok);
 	auto [ok2, err2, result] = lua.call<int>("bump"); // bump has no return value; call<int> should fail cleanly
 	REQUIRE_FALSE(ok2);
@@ -1078,28 +1078,29 @@ TEST_CASE("expose_method: std::exception thrown in C++ callable surfaces as Lua 
 {
 	Lua lua;
 	lua.expose_method<Point, int>("safe_div", std::function<int(Point, int)>(
-	                                         [](Point p, int divisor) -> int
-	                                         {
-		                                         if(divisor == 0)
-			                                         throw std::runtime_error("division by zero");
-		                                         return p.x / divisor;
-	                                         }));
+	                                          [](Point p, int divisor) -> int
+	                                          {
+		                                          if(divisor == 0)
+			                                          throw std::runtime_error("division by zero");
+		                                          return p.x / divisor;
+	                                          }));
 	lua.assign("p", Point{10, 20});
 	auto [ok, err] = lua.run_script("p:safe_div(0)");
 	REQUIRE_FALSE(ok);
 	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("division by zero"));
 }
 
-TEST_CASE("expose_method: exception does not prevent a subsequent successful call", "[expose_method][exceptions][stack]")
+TEST_CASE("expose_method: exception does not prevent a subsequent successful call",
+          "[expose_method][exceptions][stack]")
 {
 	Lua lua;
 	lua.expose_method<Point, int>("safe_div", std::function<int(Point, int)>(
-	                                         [](Point p, int divisor) -> int
-	                                         {
-		                                         if(divisor == 0)
-			                                         throw std::runtime_error("division by zero");
-		                                         return p.x / divisor;
-	                                         }));
+	                                          [](Point p, int divisor) -> int
+	                                          {
+		                                          if(divisor == 0)
+			                                          throw std::runtime_error("division by zero");
+		                                          return p.x / divisor;
+	                                          }));
 	lua.assign("p", Point{10, 20});
 
 	auto [ok1, err1] = lua.run_script("p:safe_div(0)");
@@ -1338,13 +1339,13 @@ TEST_CASE("expose_mutable_method: std::exception thrown in C++ callable surfaces
 {
 	Lua lua;
 	lua.expose_mutable_method<Point>("safe_scale", std::function<void(Point&, int)>(
-	                                             [](Point& p, int factor)
-	                                             {
-		                                             if(factor == 0)
-			                                             throw std::runtime_error("scale factor cannot be zero");
-		                                             p.x *= factor;
-		                                             p.y *= factor;
-	                                             }));
+	                                               [](Point& p, int factor)
+	                                               {
+		                                               if(factor == 0)
+			                                               throw std::runtime_error("scale factor cannot be zero");
+		                                               p.x *= factor;
+		                                               p.y *= factor;
+	                                               }));
 	lua.assign("p", Point{2, 3});
 	auto [ok, err] = lua.run_script("p:safe_scale(0)");
 	REQUIRE_FALSE(ok);
@@ -1360,13 +1361,13 @@ TEST_CASE("expose_mutable_method: self is left unmodified in Lua when the callab
 	// corrupts the Lua-side table.
 	Lua lua;
 	lua.expose_mutable_method<Point>("safe_scale", std::function<void(Point&, int)>(
-	                                             [](Point& p, int factor)
-	                                             {
-		                                             if(factor == 0)
-			                                             throw std::runtime_error("scale factor cannot be zero");
-		                                             p.x *= factor;
-		                                             p.y *= factor;
-	                                             }));
+	                                               [](Point& p, int factor)
+	                                               {
+		                                               if(factor == 0)
+			                                               throw std::runtime_error("scale factor cannot be zero");
+		                                               p.x *= factor;
+		                                               p.y *= factor;
+	                                               }));
 	lua.assign("p", Point{2, 3});
 	auto [ok, err] = lua.run_script("p:safe_scale(0)");
 	REQUIRE_FALSE(ok);
@@ -1380,13 +1381,13 @@ TEST_CASE("expose_mutable_method: exception does not prevent a subsequent succes
 {
 	Lua lua;
 	lua.expose_mutable_method<Point>("safe_scale", std::function<void(Point&, int)>(
-	                                             [](Point& p, int factor)
-	                                             {
-		                                             if(factor == 0)
-			                                             throw std::runtime_error("scale factor cannot be zero");
-		                                             p.x *= factor;
-		                                             p.y *= factor;
-	                                             }));
+	                                               [](Point& p, int factor)
+	                                               {
+		                                               if(factor == 0)
+			                                               throw std::runtime_error("scale factor cannot be zero");
+		                                               p.x *= factor;
+		                                               p.y *= factor;
+	                                               }));
 	lua.assign("p", Point{2, 3});
 
 	auto [ok1, err1] = lua.run_script("p:safe_scale(0)");
@@ -2581,4 +2582,102 @@ TEST_CASE("call: nested map with wrong inner value type returns error", "[call][
 	auto [ok, err, _8] = lua.call<std::map<std::string, std::map<std::string, int>>>("get");
 	REQUIRE(!ok);
 	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected integer"));
+}
+
+// ============================================================
+// Coroutines
+//
+// LuaCpp has no dedicated coroutine API - Lua's `coroutine` library is a
+// standard part of luaL_openlibs and is simply Lua code exercised through
+// run_script()/call(), the same as any other script. These tests show the
+// usual coroutine.create/resume/yield/status/wrap patterns, plus how a
+// coroutine can call back into a C++ function registered with expose_func.
+//
+// See LIFETIME.md, item 5, for the lifetime caveat that applies to any
+// coroutine suspended mid-execution: resuming it after the C++ objects its
+// captured closures depend on have been destroyed is undefined behaviour,
+// exactly like calling those closures directly would be.
+// ============================================================
+
+TEST_CASE("coroutine: create, resume and yield via a pure Lua script", "[coroutine]")
+{
+	Lua lua;
+
+	// A coroutine body that yields twice before returning, collected entirely
+	// on the Lua side into a table of {status, values...} snapshots so the
+	// whole sequence can be inspected with a single call<>().
+	lua.run_script(R"(
+		function drive_coroutine()
+			local co = coroutine.create(function(a, b)
+				local sum = a + b
+				local more = coroutine.yield(sum)      -- 1st suspension point
+				local doubled = more * 2
+				coroutine.yield(doubled)               -- 2nd suspension point
+				return "done"
+			end)
+
+			local results = {}
+			local ok1, v1 = coroutine.resume(co, 3, 4)     -- runs to 1st yield, sum = 7
+			table.insert(results, tostring(ok1) .. ":" .. tostring(v1))
+			local ok2, v2 = coroutine.resume(co, 10)       -- runs to 2nd yield, doubled = 20
+			table.insert(results, tostring(ok2) .. ":" .. tostring(v2))
+			local ok3, v3 = coroutine.resume(co)           -- runs to completion, returns "done"
+			table.insert(results, tostring(ok3) .. ":" .. tostring(v3))
+			table.insert(results, coroutine.status(co))    -- "dead" once the body has returned
+			return results
+		end
+	)");
+
+	auto [ok, err, results] = lua.call<std::vector<std::string>>("drive_coroutine");
+	REQUIRE(ok);
+	REQUIRE(results == std::vector<std::string>{"true:7", "true:20", "true:done", "dead"});
+}
+
+TEST_CASE("coroutine: coroutine.wrap propagates an error as a Lua error", "[coroutine]")
+{
+	Lua lua;
+
+	// coroutine.wrap returns a plain function (rather than resume's
+	// ok/value pair); an error inside the coroutine body re-raises as a
+	// normal Lua error at the call site, which run_script() surfaces the
+	// same way it would for any other runtime error.
+	auto [ok, err] = lua.run_script(R"(
+		local step = coroutine.wrap(function()
+			coroutine.yield(1)
+			error("boom inside coroutine")
+		end)
+		assert(step() == 1)
+		step() -- raises
+	)");
+
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("boom inside coroutine"));
+}
+
+TEST_CASE("coroutine: body calls a C++ function registered with expose_func", "[coroutine][expose_func]")
+{
+	Lua lua;
+
+	// A coroutine's body runs in its own Lua thread, but expose_func-registered
+	// closures are just regular Lua C functions - they can be called from
+	// inside a coroutine exactly as from the main thread.
+	lua.expose_func<int>("square", std::function<int(int)>([](int x) { return x * x; }));
+
+	lua.run_script(R"(
+		function drive()
+			local co = coroutine.create(function(n)
+				local squared = square(n)          -- call into C++ from inside the coroutine
+				local resumed_with = coroutine.yield(squared)
+				return square(resumed_with)
+			end)
+			local _, first = coroutine.resume(co, 5)   -- square(5) == 25
+			local _, second = coroutine.resume(co, 6)  -- square(6) == 36
+			return first, second
+		end
+	)");
+
+	auto [ok, err, first, second] = lua.call<int, int>("drive");
+	REQUIRE(ok);
+	REQUIRE(first == 25);
+	REQUIRE(second == 36);
 }
