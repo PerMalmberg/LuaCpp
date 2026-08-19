@@ -2681,3 +2681,480 @@ TEST_CASE("coroutine: body calls a C++ function registered with expose_func", "[
 	REQUIRE(first == 25);
 	REQUIRE(second == 36);
 }
+
+// ============================================================
+// call tracing
+// ============================================================
+
+TEST_CASE("call tracing: records nested call/return events with correct depth", "[call-tracing]")
+{
+	Lua lua;
+	std::vector<LuaCallTraceEvent> events;
+	lua.enable_call_tracing([&events](const LuaCallTraceEvent& e) { events.push_back(e); });
+
+	auto [ok, err] = lua.run_script("function inner() return 1 end\n"
+	                                "function outer() return inner() end\n"
+	                                "outer()\n");
+	REQUIRE(ok);
+
+	bool saw_call = false;
+	bool saw_return = false;
+	for(const auto& e : events)
+	{
+		if(e.is_call)
+		{
+			saw_call = true;
+		}
+		else
+		{
+			saw_return = true;
+		}
+		REQUIRE(e.depth >= 1);
+	}
+	REQUIRE(saw_call);
+	REQUIRE(saw_return);
+	const auto call_count =
+	std::count_if(events.begin(), events.end(), [](const LuaCallTraceEvent& e) { return e.is_call; });
+	REQUIRE(call_count >= 2);
+}
+
+TEST_CASE("call tracing: disable_call_tracing stops further events", "[call-tracing]")
+{
+	Lua lua;
+	std::vector<LuaCallTraceEvent> events;
+	lua.enable_call_tracing([&events](const LuaCallTraceEvent& e) { events.push_back(e); });
+
+	REQUIRE(std::get<0>(lua.run_script("function f() end f()")));
+	const auto count_after_first = events.size();
+	REQUIRE(count_after_first > 0);
+
+	lua.disable_call_tracing();
+	REQUIRE(std::get<0>(lua.run_script("function g() end g()")));
+	REQUIRE(events.size() == count_after_first);
+}
+
+TEST_CASE("call tracing: tail calls are tracked without corrupting call depth", "[call-tracing]")
+{
+	Lua lua;
+	std::vector<LuaCallTraceEvent> events;
+	lua.enable_call_tracing([&events](const LuaCallTraceEvent& e) { events.push_back(e); });
+
+	auto [ok, err] = lua.run_script("function countdown(n)\n"
+	                                "  if n <= 0 then return 0 end\n"
+	                                "  return countdown(n - 1)\n"
+	                                "end\n"
+	                                "countdown(20)\n");
+	REQUIRE(ok);
+
+	for(const auto& e : events)
+	{
+		REQUIRE(e.depth >= 1);
+		REQUIRE(e.depth <= 25);
+	}
+}
+
+TEST_CASE("call tracing: std::exception thrown by trace callback is logged, not fatal", "[call-tracing]")
+{
+	Lua lua;
+	std::vector<std::string> logged;
+	lua.enable_error_logging([&logged](std::string_view msg) { logged.emplace_back(msg); });
+	lua.enable_call_tracing([](const LuaCallTraceEvent&) { throw std::runtime_error("boom"); });
+
+	auto [ok, err] = lua.run_script("function f() end f()");
+	REQUIRE(ok);
+
+	REQUIRE(logged.size() > 0);
+	bool found = false;
+	for(const auto& line : logged)
+	{
+		if(line.find("boom") != std::string::npos)
+		{
+			found = true;
+		}
+	}
+	REQUIRE(found);
+}
+
+TEST_CASE("call tracing: non-std::exception thrown by trace callback is logged generically", "[call-tracing]")
+{
+	Lua lua;
+	std::vector<std::string> logged;
+	lua.enable_error_logging([&logged](std::string_view msg) { logged.emplace_back(msg); });
+	lua.enable_call_tracing([](const LuaCallTraceEvent&) -> void { throw 42; });
+
+	auto [ok, err] = lua.run_script("function f() end f()");
+	REQUIRE(ok);
+
+	bool found = false;
+	for(const auto& line : logged)
+	{
+		if(line.find("unknown non-std::exception") != std::string::npos)
+		{
+			found = true;
+		}
+	}
+	REQUIRE(found);
+}
+
+TEST_CASE("call tracing: throwing trace callback with error logging disabled does not break script", "[call-tracing]")
+{
+	Lua lua;
+	lua.enable_call_tracing([](const LuaCallTraceEvent&) { throw std::runtime_error("boom"); });
+
+	auto [ok, err] = lua.run_script("function f() end f()");
+	REQUIRE(ok);
+}
+
+// ============================================================
+// output capture
+// ============================================================
+
+TEST_CASE("output capture: print() is discarded by default", "[output-capture]")
+{
+	Lua lua;
+	auto [ok, err] = lua.run_script("print('hello')");
+	REQUIRE(ok);
+}
+
+TEST_CASE("output capture: print() arguments are tab-separated and newline-terminated", "[output-capture]")
+{
+	Lua lua;
+	std::vector<std::string> lines;
+	lua.enable_output_capture([&lines](std::string_view s) { lines.emplace_back(s); });
+
+	auto [ok, err] = lua.run_script("print('a', 1, true)");
+	REQUIRE(ok);
+	REQUIRE(lines.size() == 1);
+	REQUIRE(lines[0] == "a\t1\ttrue\n");
+}
+
+TEST_CASE("output capture: multiple print() calls accumulate as separate lines", "[output-capture]")
+{
+	Lua lua;
+	std::vector<std::string> lines;
+	lua.enable_output_capture([&lines](std::string_view s) { lines.emplace_back(s); });
+
+	auto [ok, err] = lua.run_script("print('first') print('second')");
+	REQUIRE(ok);
+	REQUIRE(lines.size() == 2);
+	REQUIRE(lines[0] == "first\n");
+	REQUIRE(lines[1] == "second\n");
+}
+
+TEST_CASE("output capture: disable_output_capture returns to discarding output", "[output-capture]")
+{
+	Lua lua;
+	std::vector<std::string> lines;
+	lua.enable_output_capture([&lines](std::string_view s) { lines.emplace_back(s); });
+	REQUIRE(std::get<0>(lua.run_script("print('captured')")));
+	REQUIRE(lines.size() == 1);
+
+	lua.disable_output_capture();
+	REQUIRE(std::get<0>(lua.run_script("print('not captured')")));
+	REQUIRE(lines.size() == 1);
+}
+
+TEST_CASE("output capture and error logging are independent", "[output-capture]")
+{
+	Lua lua;
+	std::vector<std::string> output_lines;
+	std::vector<std::string> error_lines;
+	lua.enable_output_capture([&output_lines](std::string_view s) { output_lines.emplace_back(s); });
+	lua.enable_call_tracing([](const LuaCallTraceEvent&) { throw std::runtime_error("boom"); });
+
+	REQUIRE(std::get<0>(lua.run_script("function f() end f()")));
+	for(const auto& line : output_lines)
+	{
+		REQUIRE(line.find("boom") == std::string::npos);
+	}
+	REQUIRE(error_lines.empty());
+}
+
+// ============================================================
+// error logging
+// ============================================================
+
+TEST_CASE("error logging: messages are prefixed and NOT newline-terminated", "[error-logging]")
+{
+	Lua lua;
+	std::vector<std::string> logged;
+	lua.enable_error_logging([&logged](std::string_view s) { logged.emplace_back(s); });
+	lua.enable_call_tracing([](const LuaCallTraceEvent&) { throw std::runtime_error("oops"); });
+
+	REQUIRE(std::get<0>(lua.run_script("function f() end f()")));
+	REQUIRE(logged.size() > 0);
+	REQUIRE(logged[0].rfind("[LuaCpp] ", 0) == 0);
+	REQUIRE(logged[0] == "[LuaCpp] oops"); // no trailing newline - consumer formats its own message
+}
+
+TEST_CASE("error logging: disable_error_logging stops delivery", "[error-logging]")
+{
+	Lua lua;
+	std::vector<std::string> logged;
+	lua.enable_error_logging([&logged](std::string_view s) { logged.emplace_back(s); });
+	lua.enable_call_tracing([](const LuaCallTraceEvent&) { throw std::runtime_error("oops"); });
+
+	REQUIRE(std::get<0>(lua.run_script("function f() end f()")));
+	REQUIRE(logged.size() > 0);
+
+	lua.disable_error_logging();
+	const auto count_before = logged.size();
+	REQUIRE(std::get<0>(lua.run_script("function g() end g()")));
+	REQUIRE(logged.size() == count_before);
+}
+
+TEST_CASE("error logging: run_script syntax error is logged", "[error-logging]")
+{
+	Lua lua;
+	std::vector<std::string> logged;
+	lua.enable_error_logging([&logged](std::string_view s) { logged.emplace_back(s); });
+
+	auto [ok, err] = lua.run_script("@@@ not valid lua");
+	REQUIRE_FALSE(ok);
+	REQUIRE(logged.size() == 1);
+	REQUIRE(logged[0].find(err) != std::string::npos);
+}
+
+TEST_CASE("error logging: run_script runtime error is logged", "[error-logging]")
+{
+	Lua lua;
+	std::vector<std::string> logged;
+	lua.enable_error_logging([&logged](std::string_view s) { logged.emplace_back(s); });
+
+	auto [ok, err] = lua.run_script("error('boom')");
+	REQUIRE_FALSE(ok);
+	REQUIRE(logged.size() == 1);
+	REQUIRE(logged[0].find("boom") != std::string::npos);
+}
+
+TEST_CASE("error logging: call<> failure paths are logged", "[error-logging]")
+{
+	// "Not a function" path
+	{
+		Lua lua;
+		std::vector<std::string> logged;
+		lua.enable_error_logging([&logged](std::string_view s) { logged.emplace_back(s); });
+		auto [ok, err] = lua.call<>("does_not_exist");
+		REQUIRE_FALSE(ok);
+		REQUIRE(logged.size() == 1);
+		REQUIRE(logged[0].find("Not a function") != std::string::npos);
+	}
+
+	// lua_pcall failure path
+	{
+		Lua lua;
+		std::vector<std::string> logged;
+		lua.enable_error_logging([&logged](std::string_view s) { logged.emplace_back(s); });
+		REQUIRE(std::get<0>(lua.run_script("function boom() error('kaboom') end")));
+		auto [ok, err] = lua.call<>("boom");
+		REQUIRE_FALSE(ok);
+		REQUIRE(logged.size() == 1);
+		REQUIRE(logged[0].find("kaboom") != std::string::npos);
+	}
+
+	// collect<>() type-mismatch path
+	{
+		Lua lua;
+		std::vector<std::string> logged;
+		lua.enable_error_logging([&logged](std::string_view s) { logged.emplace_back(s); });
+		REQUIRE(std::get<0>(lua.run_script("function give_string() return 'not an int' end")));
+		auto [ok, err, value] = lua.call<int>("give_string");
+		REQUIRE_FALSE(ok);
+		REQUIRE(logged.size() == 1);
+	}
+}
+
+TEST_CASE("error logging: exception thrown by an expose_func callable is logged", "[error-logging]")
+{
+	Lua lua;
+	std::vector<std::string> logged;
+	lua.enable_error_logging([&logged](std::string_view s) { logged.emplace_back(s); });
+	lua.expose_func("boom", std::function<void()>([]() { throw std::runtime_error("exposed boom"); }));
+
+	auto [ok, err] = lua.run_script("boom()");
+	REQUIRE_FALSE(ok);
+	// Both the trampoline's catch(std::exception) AND run_script's outer
+	// lua_pcall-failure path log independently - this is expected: Tier 1
+	// (trampoline) logs the raw C++ exception as soon as it's caught, and
+	// Tier 2 (run_script) logs the resulting {false, msg} Lua error
+	// separately, so the same underlying failure is intentionally reported
+	// twice via two different code paths.
+	REQUIRE(logged.size() == 2);
+	bool found = false;
+	for(const auto& line : logged)
+	{
+		if(line.find("exposed boom") != std::string::npos)
+		{
+			found = true;
+		}
+	}
+	REQUIRE(found);
+}
+
+TEST_CASE("error logging: duplicate method registration is logged before throwing", "[error-logging]")
+{
+	struct LogDupPoint
+	{
+		int x = 0;
+	};
+
+	Lua lua;
+	std::vector<std::string> logged;
+	lua.enable_error_logging([&logged](std::string_view s) { logged.emplace_back(s); });
+
+	// Registered inline via a locally-defined struct would require LUA_REGISTER_STRUCT
+	// at namespace scope, which isn't possible inside a test body; instead exercise the
+	// duplicate-registration path using a struct already registered elsewhere in this
+	// file (Point), guarding against collisions with existing test method names.
+	lua.expose_method<Point, int>("log_dup_test_method", std::function<int(Point)>([](Point p) { return p.x; }));
+	bool threw = false;
+	try
+	{
+		lua.expose_method<Point, int>("log_dup_test_method", std::function<int(Point)>([](Point p) { return p.x; }));
+	}
+	catch(const std::runtime_error&)
+	{
+		threw = true;
+	}
+	REQUIRE(threw);
+	REQUIRE(logged.size() == 1);
+	REQUIRE(logged[0].find("already registered") != std::string::npos);
+}
+
+// ============================================================
+// instruction counting
+// ============================================================
+
+TEST_CASE("instruction counting: count increases across a loop-heavy script", "[instruction-counting]")
+{
+	Lua lua;
+	lua.enable_instruction_counting(100);
+	REQUIRE(lua.get_instruction_count() == 0);
+
+	auto [ok, err] = lua.run_script("local sum = 0\nfor i = 1, 100000 do sum = sum + i end\n");
+	REQUIRE(ok);
+	REQUIRE(lua.get_instruction_count() > 0);
+}
+
+TEST_CASE("instruction counting: disable_instruction_counting stops accumulation", "[instruction-counting]")
+{
+	Lua lua;
+	lua.enable_instruction_counting(100);
+	REQUIRE(std::get<0>(lua.run_script("for i = 1, 100000 do end")));
+	const auto count_after_first = lua.get_instruction_count();
+	REQUIRE(count_after_first > 0);
+
+	lua.disable_instruction_counting();
+	REQUIRE(std::get<0>(lua.run_script("for i = 1, 100000 do end")));
+	REQUIRE(lua.get_instruction_count() == count_after_first);
+}
+
+// ============================================================
+// instruction limit (protection)
+// ============================================================
+
+TEST_CASE("instruction limit: infinite loop is aborted with a catchable error", "[instruction-limit]")
+{
+	Lua lua;
+	lua.set_instruction_limit(10000, 100);
+
+	auto [ok, err] = lua.run_script("while true do end");
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("instruction limit"));
+}
+
+TEST_CASE("instruction limit: script under the limit succeeds", "[instruction-limit]")
+{
+	Lua lua;
+	lua.set_instruction_limit(10000000, 1000);
+
+	auto [ok, err] = lua.run_script("x = 1 + 1");
+	REQUIRE(ok);
+}
+
+TEST_CASE("instruction limit: clear_instruction_limit removes the cap", "[instruction-limit]")
+{
+	Lua lua;
+	lua.set_instruction_limit(1000, 100);
+	lua.clear_instruction_limit();
+
+	auto [ok, err] = lua.run_script("local sum = 0 for i = 1, 200000 do sum = sum + i end");
+	REQUIRE(ok);
+}
+
+// ============================================================
+// recursion depth cap (protection)
+// ============================================================
+
+TEST_CASE("recursion depth cap: deep recursion is aborted with a catchable error", "[recursion-depth-cap]")
+{
+	Lua lua;
+	lua.set_recursion_depth_cap(50);
+
+	auto [ok, err] = lua.run_script("function recurse(n)\n"
+	                                "  if n <= 0 then return 0 end\n"
+	                                "  local r = recurse(n - 1)\n"
+	                                "  return r + 1\n"
+	                                "end\n"
+	                                "recurse(1000)\n");
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("recursion depth limit"));
+}
+
+TEST_CASE("recursion depth cap: scripts under the cap are unaffected", "[recursion-depth-cap]")
+{
+	Lua lua;
+	lua.set_recursion_depth_cap(50);
+
+	auto [ok, err] = lua.run_script("function recurse(n)\n"
+	                                "  if n <= 0 then return 0 end\n"
+	                                "  return recurse(n - 1) + 1\n"
+	                                "end\n"
+	                                "assert(recurse(10) == 10)\n");
+	REQUIRE(ok);
+}
+
+TEST_CASE("recursion depth cap: clear_recursion_depth_cap removes the cap", "[recursion-depth-cap]")
+{
+	Lua lua;
+	lua.set_recursion_depth_cap(10);
+	lua.clear_recursion_depth_cap();
+
+	auto [ok, err] = lua.run_script("function recurse(n)\n"
+	                                "  if n <= 0 then return 0 end\n"
+	                                "  return recurse(n - 1) + 1\n"
+	                                "end\n"
+	                                "assert(recurse(200) == 200)\n");
+	REQUIRE(ok);
+}
+
+// ============================================================
+// hooks integration - merged mask correctness
+// ============================================================
+
+TEST_CASE("hooks integration: call tracing, instruction limit, and depth cap coexist", "[hooks-integration]")
+{
+	Lua lua;
+	std::vector<LuaCallTraceEvent> events;
+	lua.enable_call_tracing([&events](const LuaCallTraceEvent& e) { events.push_back(e); });
+	lua.set_instruction_limit(10000000, 1000);
+	lua.set_recursion_depth_cap(100);
+
+	auto [ok, err] = lua.run_script("function recurse(n)\n"
+	                                "  if n <= 0 then return 0 end\n"
+	                                "  return recurse(n - 1) + 1\n"
+	                                "end\n"
+	                                "assert(recurse(10) == 10)\n");
+	REQUIRE(ok);
+	REQUIRE(events.size() > 0);
+
+	events.clear();
+	auto [ok2, err2] = lua.run_script("function recurse2(n)\n"
+	                                  "  if n <= 0 then return 0 end\n"
+	                                  "  return recurse2(n - 1) + 1\n"
+	                                  "end\n"
+	                                  "recurse2(1000)\n");
+	REQUIRE_FALSE(ok2);
+	REQUIRE_THAT(err2, Catch::Matchers::ContainsSubstring("recursion depth limit"));
+	REQUIRE(events.size() > 0);
+}

@@ -344,6 +344,202 @@ itself. Now that /EHa is applied project-wide, Lua's native C++ exception
 error handling is preferable (more idiomatic C++, proper RAII/destructor
 unwinding) and LUA_USE_LONGJMP is no longer needed/set.
 
+## Implemented: Script Auditing & Protection hooks (call tracing, output
+## capture, error logging, instruction counting/limit, recursion depth cap)
+
+Added to src/Lua.hpp (declared at namespace scope, above `class Lua`):
+```cpp
+struct LuaCallTraceEvent { std::string name; bool is_call; int depth; };
+using LuaCallTraceCallback = std::function<void(const LuaCallTraceEvent&)>;
+using LuaOutputCallback = std::function<void(std::string_view)>;
+using LuaErrorLogCallback = std::function<void(std::string_view)>;
+```
+
+Design: all four hook-based features (call tracing, instruction counting,
+instruction limit, recursion depth cap) share ONE `lua_sethook`
+installation, since Lua only allows one hook callback+mask per lua_State.
+A private `HookState hooks;` member holds all the state; `refresh_hook_mask()`
+recomputes the merged mask (LUA_MASKCALL/LUA_MASKRET/LUA_MASKCOUNT) from
+whichever features are active and re-installs `lua_sethook` (or removes it
+entirely via `lua_sethook(L, nullptr, 0, 0)` if nothing needs it). A single
+static `master_hook(L, ar)` recovers `Lua*` and dispatches by `ar->event` in
+member function `dispatch_hook()`.
+
+Sentinel-value convention (avoids extra bools): `instruction_limit == 0`
+means disabled, `max_depth == 0` means disabled, `trace_callback` empty
+means disabled. Only `counting_enabled` (bool) has no natural sentinel and
+stays an explicit flag, since `instruction_count == 0` doesn't imply
+"disabled".
+
+**Recovering `Lua*` in static callbacks**: `lua_getextraspace(L)` returns a
+`void*` slot with process lifetime tied to the lua_State; store `this`
+there once in the constructor:
+```cpp
+*static_cast<Lua**>(lua_getextraspace(static_cast<lua_State*>(*this))) = this;
+```
+IMPORTANT GOTCHA: `lua_getextraspace` is a MACRO that does raw pointer
+arithmetic on its argument - it needs an actual `lua_State*`, not something
+that merely has an implicit user-defined conversion to one. Passing `*this`
+directly (relying on `Lua::operator lua_State*()`) fails to compile with a
+confusing clang error ("Cannot cast from type 'Lua' to pointer type
+'char *'") because the macro expansion tries to do pointer arithmetic on
+the `Lua` object itself before any conversion happens. Fix: force the
+conversion explicitly with `static_cast<lua_State*>(*this)` before passing
+it in. (Ordinary non-macro API calls like `lua_pushnil(*this)` don't have
+this problem since normal function argument passing does apply the
+implicit conversion.)
+
+**print() output goes nowhere by default** - `captured_print` (a plain
+non-capturing `lua_CFunction`, no upvalue machinery needed) is installed as
+the `print` global directly in the constructor. It's a no-op unless
+`enable_output_capture(cb)` has been called; `disable_output_capture()`
+returns to discarding, NOT to writing to stdout - there is no "restore
+original print" logic at all, by design (ties into the Sandboxing TODO
+item: scripts never get free stdout access via print, even before any
+other sandboxing is applied).
+
+**Error logging is a SEPARATE callback from output capture**
+(`enable_error_logging`/`disable_error_logging`, backed by
+`error_log_callback`, distinct from `output_callback`) - deliberately so a
+caller can log internal LuaCpp problems (currently: exceptions thrown by a
+user's call-trace callback) without being forced to also capture/discard
+print() traffic, and vice versa. Messages are `"[LuaCpp] "`-prefixed,
+newline-terminated.
+
+**Call tracing does not store history in `Lua` itself** - events are
+pushed synchronously to a user-supplied `LuaCallTraceCallback`; the class
+retains zero call-trace state beyond `hooks.call_depth` bookkeeping.
+Exceptions thrown by the trace callback are caught (`std::exception`
+specifically for `.what()`, then a generic `catch(...)`) and routed through
+`log_error()` -> `error_log_callback`; the script itself is never aborted
+by a misbehaving trace callback.
+
+**Real bug caught in testing #1 - instruction limit hung forever**: the
+`LUA_HOOKCOUNT` branch originally only incremented `hooks.instruction_count`
+when `hooks.counting_enabled` was true. But `set_instruction_limit()` alone
+(without also calling `enable_instruction_counting()`) doesn't set that
+flag - so the counter never advanced and `while true do end` looped
+forever, hanging the test suite. Fix: increment `instruction_count`
+unconditionally inside `LUA_HOOKCOUNT` - the branch only ever fires when
+`LUA_MASKCOUNT` is installed at all, which only happens when counting
+and/or the limit is actually active, so the unconditional increment is
+always correct there.
+
+**Real bug caught in testing #2 - `%llu` not supported by Lua's own error
+formatting**: `luaL_error`/`lua_pushvfstring` only implement Lua's own small
+format-specifier subset (`%d`, `%s`, `%f`, `%p`, `%c`, `%U`, `%I`, `%%`) -
+NOT the C/glibc `%llu`. Using `%llu` caused the literal text
+`"instruction limit exceeded (%llu)"` to appear unformatted in the error
+message (silently wrong, not a crash - easy to miss without an exact-match
+test). Fix: format the number in C++ first
+(`std::to_string(hooks.instruction_limit)`) and pass it through as a plain
+`%s`. `%d` with a plain `int` (used for the recursion-depth-cap error
+message) is fine since Lua's own `%d` matches a `va_arg(argp, int)`.
+
+Public API added to `Lua`:
+- `enable_call_tracing(LuaCallTraceCallback)` / `disable_call_tracing()`
+- `enable_output_capture(LuaOutputCallback)` / `disable_output_capture()`
+- `enable_error_logging(LuaErrorLogCallback)` / `disable_error_logging()`
+- `enable_instruction_counting(int period = 1000)` /
+  `disable_instruction_counting()` / `get_instruction_count() const`
+- `set_instruction_limit(std::uint64_t limit, int period = 1000)` /
+  `clear_instruction_limit()`
+- `set_recursion_depth_cap(int max_depth)` / `clear_recursion_depth_cap()`
+
+Tests added in `src/test.cpp` under tags `[call-tracing]`,
+`[output-capture]`, `[error-logging]`, `[instruction-counting]`,
+`[instruction-limit]`, `[recursion-depth-cap]`, `[hooks-integration]` - 22
+new test cases (110 assertions), full suite now 205/205 passing on Linux
+(debug preset). `[hooks-integration]` specifically validates that call
+tracing + instruction limit + recursion depth cap enabled simultaneously
+don't clobber each other's `lua_sethook` registration - the core point of
+the merged-mask design.
+
+Also fixed pre-existing style nit while touching `close()`: single-line
+`if(closed) return;` was wrapped in `{ }` per project style requested
+during this session (brace-wrap all single-line if-blocks in new/touched
+code).
+
+Reusable pattern for any FUTURE `lua_sethook`-based feature (e.g.
+`LUA_MASKLINE` line-level tracing): add fields to `HookState`, fold the new
+mask bit into `refresh_hook_mask()`, add a `case` to `dispatch_hook()`. Do
+NOT call `lua_sethook` directly from a new feature's enable/disable method -
+always go through `refresh_hook_mask()` so merging keeps working.
+
+## Added log_error() calls at Tier 1 + Tier 2 sites throughout Lua.hpp
+
+After the hook infrastructure above was in place, added `log_error()` calls
+at every place that previously failed silently (Tier 1) or only reported
+failure via the `{false, msg}` tuple convention (Tier 2), routing them all
+through the same `error_log_callback` set by `enable_error_logging`:
+
+Tier 1 (previously fully silent / internal conditions):
+- `trampoline()` - stale `weak_ptr<LuaFunc>` (expired registered callable)
+  now logs before calling `luaL_error`.
+- `trampoline()` - `catch(const std::exception& e)` around a registered
+  C++ callable (`expose_func`/`expose_method`/`expose_mutable_method`) now
+  logs `e.what()` before converting it to a Lua error. `trampoline` is
+  `static`, so it recovers `Lua*` the same way `master_hook` does, via
+  `lua_getextraspace(L)`, and guards every `self->log_error(...)` call with
+  `if(self)`.
+
+Tier 2 (previously only visible via the returned tuple):
+- `run_script()` - both failure paths (`luaL_loadstring` syntax error,
+  `lua_pcall` runtime error) now call `log_error(msg)` before returning.
+- `call<>()` - all three failure paths ("Not a function", `lua_pcall`
+  failure, and the `collect<>()` type-mismatch `catch(const
+  std::runtime_error&)`) now call `log_error(...)`.
+- `add_method_to_registry` (duplicate `expose_method`/
+  `expose_mutable_method` registration) - static function, recovers `Lua*`
+  via `lua_getextraspace(L)` the same way, logs the message before
+  `throw`ing the `std::runtime_error` (this is a registration-time C++
+  exception, not a Lua error, so it can't go through the trampoline's own
+  logging path - had to add its own `lua_getextraspace` lookup).
+
+**Important discovered behavior - intentional duplicate log entries**: an
+exception thrown from an `expose_func` callable, invoked via
+`run_script()`, now produces **2** log entries for the same underlying
+failure: one from `trampoline()`'s `catch` (Tier 1, logs the raw
+`e.what()`) and one from `run_script()`'s `lua_pcall`-failed branch (Tier
+2, logs the resulting Lua error string, which also contains `e.what()`
+since `trampoline` formats it via `luaL_error(L, "%s", e.what())`). This is
+NOT a bug - it's the natural consequence of instrumenting both layers
+independently. A test (`error logging: exception thrown by an expose_func
+callable is logged`) explicitly asserts `logged.size() == 2` with a
+comment explaining why. If a caller wants exactly one log entry per
+failure they should log only via `enable_error_logging` OR inspect the
+returned tuple themselves, not both, or dedupe based on content.
+
+By contrast, a *pure Lua-level* error (e.g. `error('kaboom')` called from
+within a Lua function invoked via `call<>()`) is logged only ONCE (by
+`call<>()`'s own Tier-2 site) since it never passes through the
+`trampoline`/`catch(std::exception)` path at all - only errors originating
+from C++ exceptions inside registered callables get double-logged.
+
+Added 8 more test cases (`[error-logging]` tag) covering: run_script syntax
+error, run_script runtime error, all three call<>() failure paths (one
+TEST_CASE with 3 sub-scopes), expose_func exception (double-log
+confirmed), and duplicate method registration. Full suite now 210/210
+passing.
+
+## log_error() no longer appends a trailing newline
+
+Changed `log_error(std::string_view what)` to build `"[LuaCpp] " + what`
+WITHOUT a trailing `'\n'` - the consumer's callback is now responsible for
+its own line formatting (append '\n' when writing to a stream, or none at
+all when appending to a structured log record/vector). This only affects
+`error_log_callback` (via `enable_error_logging`) - `output_callback` (via
+`enable_output_capture`, used by `captured_print`) is UNRELATED and still
+appends '\n' per print() call, matching Lua's own print() semantics - that
+one was not touched.
+
+Updated the doc comments on `log_error` and `enable_error_logging`
+accordingly, and fixed/renamed the test that used to assert
+`logged[0].back() == '\n'` - now asserts exact equality
+`logged[0] == "[LuaCpp] oops"` instead, with the test title changed to
+"messages are prefixed and NOT newline-terminated". Full suite still
+210/210 after the change.
+
 ## Status as of last update
 Simplified to single-unity-TU + /EHa fix, WITHOUT LUA_USE_LONGJMP (Lua
 uses native C++ exceptions for error handling). Verified locally on

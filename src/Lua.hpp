@@ -5,12 +5,15 @@ extern "C"
 #include <lualib.h>
 }
 
+#include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <list>
 #include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -144,12 +147,28 @@ struct is_std_map<std::unordered_map<K, V, H, E, A>> : std::true_type
 {
 };
 
+// Emitted for every Lua function call/return while call tracing is active -
+// see Lua::enable_call_tracing.
+struct LuaCallTraceEvent
+{
+	std::string name; // best-effort function name; "?" if Lua couldn't determine one
+	bool is_call; // true = call/tailcall event, false = return event
+	int depth; // call-stack depth at the moment of this event (1 = outermost call)
+};
+
+using LuaCallTraceCallback = std::function<void(const LuaCallTraceEvent&)>;
+using LuaOutputCallback = std::function<void(std::string_view)>;
+using LuaErrorLogCallback = std::function<void(std::string_view)>;
+
 class Lua final
 {
   public:
 	Lua()
 	{
 		luaL_openlibs(*this);
+		*static_cast<Lua**>(lua_getextraspace(static_cast<lua_State*>(*this))) = this;
+		lua_pushcfunction(*this, &Lua::captured_print);
+		lua_setglobal(*this, "print"); // default: print() output goes nowhere
 	}
 
 	~Lua() = default;
@@ -186,7 +205,9 @@ class Lua final
 	void close()
 	{
 		if(closed)
+		{
 			return;
+		}
 
 		for(const auto& name : registered_global_names)
 		{
@@ -212,17 +233,152 @@ class Lua final
 	Lua(Lua&&) = delete;
 	Lua& operator=(Lua&&) = delete;
 
+	// ---------------------------------------------------------------------------
+	// Call tracing, output capture, error logging, and script-protection hooks
+	//
+	// All of these are backed by a single lua_sethook installation (Lua only
+	// allows one hook callback + mask per lua_State), merged and re-installed
+	// via refresh_hook_mask() whenever any one of them is (re)configured, so
+	// enabling several of them together composes safely instead of one
+	// overwriting another's registration.
+	// ---------------------------------------------------------------------------
+
+	// Installs `cb`, invoked synchronously on every Lua function call/return
+	// while tracing is active. `cb` runs from inside the Lua hook - it must be
+	// cheap and must not rely on exceptions escaping uncleanly: any
+	// std::exception it throws is caught here and reported via the error-log
+	// callback (see enable_error_logging), if one is registered; non-
+	// std::exception throws are also caught and reported generically. Either
+	// way the script itself is unaffected - tracing failures never abort
+	// execution.
+	//
+	// Value-capture in `cb` is always safe; reference captures must not
+	// outlive this Lua instance (same rule as expose_func/expose_method).
+	void enable_call_tracing(LuaCallTraceCallback cb)
+	{
+		hooks.trace_callback = std::move(cb);
+		refresh_hook_mask();
+	}
+
+	void disable_call_tracing()
+	{
+		hooks.trace_callback = nullptr;
+		refresh_hook_mask();
+	}
+
+	// By default, before this is ever called, print() output is discarded
+	// entirely - LuaCpp never writes to stdout. Call this to start receiving
+	// print() output via `cb`: one call per invocation of print(), arguments
+	// tab-separated (honouring any __tostring metamethod, via luaL_tolstring,
+	// matching Lua's own print() formatting) and newline-terminated.
+	// disable_output_capture() returns to discarding output - it does NOT
+	// restore writing to stdout. Independent of error logging - see
+	// enable_error_logging; enabling one does not affect the other.
+	void enable_output_capture(LuaOutputCallback cb)
+	{
+		output_callback = std::move(cb);
+	}
+
+	void disable_output_capture()
+	{
+		output_callback = nullptr;
+	}
+
+	// By default, internal LuaCpp problems (currently: an exception thrown by
+	// a call-trace callback registered via enable_call_tracing) are silently
+	// dropped. Call this to receive them via `cb` as single, "[LuaCpp] "-
+	// prefixed messages - NOT newline-terminated; the consumer's callback is
+	// responsible for its own line formatting (e.g. appending '\n' when
+	// writing to a stream, or none at all when appending to a structured log
+	// record). Independent of enable_output_capture - does not receive
+	// print() output, and does not require print() capture to be enabled.
+	void enable_error_logging(LuaErrorLogCallback cb)
+	{
+		error_log_callback = std::move(cb);
+	}
+
+	void disable_error_logging()
+	{
+		error_log_callback = nullptr;
+	}
+
+	// Enables LUA_MASKCOUNT-based instruction counting: get_instruction_count()
+	// increases by roughly `period` Lua VM instructions at a time (an
+	// approximation - lua_sethook's count parameter fires the hook every
+	// `period` instructions, and the counter is incremented by `period` on
+	// each firing rather than tracking the exact instruction executed).
+	// If instruction-limit protection (set_instruction_limit) is also active,
+	// the smaller of the two requested periods is used for both, since Lua
+	// only supports a single count-period per lua_State.
+	void enable_instruction_counting(int period = 1000)
+	{
+		hooks.counting_enabled = true;
+		hooks.instruction_count = 0;
+		update_count_period(period);
+		refresh_hook_mask();
+	}
+
+	void disable_instruction_counting()
+	{
+		hooks.counting_enabled = false;
+		update_count_period(0);
+		refresh_hook_mask();
+	}
+
+	std::uint64_t get_instruction_count() const
+	{
+		return hooks.instruction_count;
+	}
+
+	// Enables the instruction-limit protection: once the running instruction
+	// count reaches `limit`, the next LUA_HOOKCOUNT firing raises a catchable
+	// Lua error (visible via run_script's/call<>'s {false, msg} return),
+	// aborting the offending script. See enable_instruction_counting for the
+	// note on shared count periods when both features are active together.
+	void set_instruction_limit(std::uint64_t limit, int period = 1000)
+	{
+		hooks.instruction_limit = limit;
+		update_count_period(period);
+		refresh_hook_mask();
+	}
+
+	void clear_instruction_limit()
+	{
+		hooks.instruction_limit = 0;
+		update_count_period(0);
+		refresh_hook_mask();
+	}
+
+	// Enables the recursion-depth-cap protection: once the Lua call stack
+	// depth (tracked via LUA_MASKCALL/LUA_MASKRET) exceeds `max_depth`, the
+	// next call raises a catchable Lua error instead of recursing further.
+	void set_recursion_depth_cap(int max_depth)
+	{
+		hooks.max_depth = max_depth;
+		refresh_hook_mask();
+	}
+
+	void clear_recursion_depth_cap()
+	{
+		hooks.max_depth = 0;
+		refresh_hook_mask();
+	}
+
 	std::tuple<bool, std::string> run_script(const char* script)
 	{
 		// Use luaL_loadstring + lua_pcall(L,0,0,0) to discard script return values and prevent stack
 		// growth on repeated calls
 		if(luaL_loadstring(*this, script) != LUA_OK)
 		{
-			return {false, get_error_message()};
+			auto msg = get_error_message();
+			log_error(msg);
+			return {false, std::move(msg)};
 		}
 		if(lua_pcall(*this, 0, 0, 0) != LUA_OK)
 		{
-			return {false, get_error_message()};
+			auto msg = get_error_message();
+			log_error(msg);
+			return {false, std::move(msg)};
 		}
 		return {true, {}};
 	}
@@ -264,7 +420,9 @@ class Lua final
 		if(!lua_isfunction(*this, TOP_OF_STACK))
 		{
 			lua_pop(*this, 1); // Remove the non-function value from the stack
-			return {false, "Not a function: " + std::string(func), ReturnTypes{}...};
+			auto msg = "Not a function: " + std::string(func);
+			log_error(msg);
+			return {false, std::move(msg), ReturnTypes{}...};
 		}
 
 		(push(state.get(), decay_for_push(std::forward<Args>(args))),
@@ -275,7 +433,9 @@ class Lua final
 
 		if(lua_pcall(*this, arg_count, ret_count, 0) != LUA_OK)
 		{
-			return {false, get_error_message(), ReturnTypes{}...};
+			auto msg = get_error_message();
+			log_error(msg);
+			return {false, std::move(msg), ReturnTypes{}...};
 		}
 
 		try
@@ -287,6 +447,7 @@ class Lua final
 		catch(const std::runtime_error& e)
 		{
 			lua_pop(*this, ret_count);
+			log_error(e.what());
 			return {false, e.what(), ReturnTypes{}...};
 		}
 	}
@@ -528,6 +689,262 @@ class Lua final
 	struct NoOwner
 	{
 	};
+
+	// ---------------------------------------------------------------------------
+	// Hook-based auditing/protection state (call tracing, instruction counting,
+	// instruction limit, recursion depth cap) - see the public enable_*/set_*
+	// methods above. All four share a single lua_sethook installation, since
+	// Lua only allows one hook callback + mask per lua_State; refresh_hook_mask()
+	// merges whichever of these are currently active into one mask.
+	// ---------------------------------------------------------------------------
+	struct HookState
+	{
+		// Call tracing - no natural "disabled" sentinel value, so an empty
+		// std::function (rather than a separate bool) IS the disabled state.
+		LuaCallTraceCallback trace_callback;
+
+		// Instruction counting - needs its own flag since instruction_count == 0
+		// does not imply "disabled" (e.g. right after being (re)enabled).
+		bool counting_enabled = false;
+		std::uint64_t instruction_count = 0;
+
+		// Instruction limit (protection) - 0 unambiguously means "no limit set".
+		std::uint64_t instruction_limit = 0;
+
+		// Recursion depth cap (protection) - 0 unambiguously means "no cap set".
+		int max_depth = 0;
+
+		// Shared call-depth bookkeeping used by both call tracing and the
+		// recursion depth cap; not itself a feature flag.
+		int call_depth = 0;
+
+		// Shared LUA_MASKCOUNT period between instruction counting and the
+		// instruction limit, since lua_sethook only accepts a single count
+		// period per lua_State. See update_count_period().
+		int count_period = 0;
+	};
+	HookState hooks;
+
+	// Sink for print() output - see enable_output_capture/disable_output_capture.
+	// Empty by default: print() output is discarded, never written to stdout.
+	LuaOutputCallback output_callback;
+
+	// Sink for internal LuaCpp error reports (currently: exceptions thrown by a
+	// call-trace callback) - see enable_error_logging/disable_error_logging.
+	// Deliberately independent of output_callback: enabling one does not imply
+	// or require the other.
+	LuaErrorLogCallback error_log_callback;
+
+	// Recomputes the requested LUA_MASKCOUNT period as the minimum of whatever
+	// instruction-counting and instruction-limit each currently want, since
+	// lua_sethook only supports one count period per lua_State. Passing 0
+	// means "this feature no longer has an opinion"; if neither feature wants
+	// a period any more, count_period collapses back to 0 (harmless - it's
+	// only used when LUA_MASKCOUNT is actually included in the mask).
+	void update_count_period(int requested)
+	{
+		int period = 0;
+		if(hooks.counting_enabled)
+		{
+			period = period == 0 ? requested : std::min(period, requested);
+		}
+		if(hooks.instruction_limit > 0)
+		{
+			period = period == 0 ? requested : std::min(period, requested);
+		}
+		hooks.count_period = period > 0 ? period : requested;
+	}
+
+	// Merges whichever hook-based features are currently active into a single
+	// lua_sethook mask and (re)installs it - or removes the hook entirely when
+	// nothing needs it. Must be called after any change to `hooks`.
+	void refresh_hook_mask()
+	{
+		int mask = 0;
+		if(hooks.trace_callback || hooks.max_depth > 0)
+		{
+			mask |= LUA_MASKCALL;
+			if(hooks.trace_callback)
+			{
+				mask |= LUA_MASKRET;
+			}
+		}
+		if(hooks.counting_enabled || hooks.instruction_limit > 0)
+		{
+			mask |= LUA_MASKCOUNT;
+		}
+
+		if(mask == 0)
+		{
+			lua_sethook(*this, nullptr, 0, 0);
+		}
+		else
+		{
+			lua_sethook(*this, &Lua::master_hook, mask, hooks.count_period);
+		}
+	}
+
+	// Reports an internal LuaCpp problem (currently only: an exception thrown
+	// from a user-supplied call-trace callback) via error_log_callback, if one
+	// is registered. Silently dropped otherwise. Never throws.
+	//
+	// The message is prefixed with "[LuaCpp] " but is NOT newline-terminated -
+	// the consumer's callback is responsible for its own line formatting
+	// (e.g. appending '\n' before writing to a stream, or none at all if
+	// appending to a structured log record).
+	void log_error(std::string_view what)
+	{
+		if(!error_log_callback)
+		{
+			return;
+		}
+		std::string line = "[LuaCpp] ";
+		line.append(what);
+		try
+		{
+			error_log_callback(line);
+		}
+		catch(...)
+		{
+			// Logging itself must never throw back into hook code.
+		}
+	}
+
+	// Best-effort function name for a call/return hook event; "?" when Lua
+	// couldn't determine one (e.g. anonymous functions, tail calls).
+	static std::string get_call_name(lua_State* L, lua_Debug* ar)
+	{
+		lua_getinfo(L, "nS", ar);
+		return ar->name ? std::string(ar->name) : std::string("?");
+	}
+
+	// Single lua_sethook callback shared by call tracing, instruction counting,
+	// the instruction limit, and the recursion depth cap. Recovers the owning
+	// Lua instance via lua_getextraspace (set once in the constructor) and
+	// dispatches by event type.
+	static void master_hook(lua_State* L, lua_Debug* ar)
+	{
+		auto* self = *static_cast<Lua**>(lua_getextraspace(L));
+		if(self)
+		{
+			self->dispatch_hook(L, ar);
+		}
+	}
+
+	void dispatch_hook(lua_State* L, lua_Debug* ar)
+	{
+		switch(ar->event)
+		{
+			case LUA_HOOKCALL:
+			case LUA_HOOKTAILCALL:
+			{
+				++hooks.call_depth;
+				if(hooks.trace_callback)
+				{
+					try
+					{
+						hooks.trace_callback(LuaCallTraceEvent{get_call_name(L, ar), true, hooks.call_depth});
+					}
+					catch(const std::exception& e)
+					{
+						log_error(e.what());
+					}
+					catch(...)
+					{
+						log_error("unknown non-std::exception thrown");
+					}
+				}
+				if(hooks.max_depth > 0 && hooks.call_depth > hooks.max_depth)
+				{
+					luaL_error(L, "recursion depth limit exceeded (%d)", hooks.max_depth);
+				}
+				break;
+			}
+			case LUA_HOOKRET:
+			{
+				if(hooks.trace_callback)
+				{
+					try
+					{
+						hooks.trace_callback(LuaCallTraceEvent{get_call_name(L, ar), false, hooks.call_depth});
+					}
+					catch(const std::exception& e)
+					{
+						log_error(e.what());
+					}
+					catch(...)
+					{
+						log_error("unknown non-std::exception thrown");
+					}
+				}
+				--hooks.call_depth;
+				break;
+			}
+			case LUA_HOOKCOUNT:
+			{
+				// This branch only fires while LUA_MASKCOUNT is installed, which only
+				// happens when counting_enabled and/or instruction_limit is active (see
+				// refresh_hook_mask) - so the counter must advance unconditionally here,
+				// regardless of whether get_instruction_count() reporting is enabled.
+				// Otherwise set_instruction_limit() alone (without also calling
+				// enable_instruction_counting()) would never observe progress and an
+				// infinite loop would never be aborted.
+				hooks.instruction_count += static_cast<std::uint64_t>(hooks.count_period);
+				if(hooks.instruction_limit > 0 && hooks.instruction_count >= hooks.instruction_limit)
+				{
+					// Lua's luaL_error/lua_pushvfstring only understands its own small
+					// format subset (%d, %s, %f, %p, %c, %U, %I, %%) - NOT the C/glibc
+					// %llu specifier, which would otherwise leak into the error message
+					// verbatim instead of being substituted. Format the number in C++
+					// first and pass it through as a plain %s.
+					luaL_error(L, "instruction limit exceeded (%s)", std::to_string(hooks.instruction_limit).c_str());
+				}
+				break;
+			}
+			default:
+				break;
+		}
+	}
+
+	// Replacement for the Lua global `print`, installed by the constructor.
+	// Formats arguments exactly like Lua's own print() (tab-separated,
+	// honouring __tostring via luaL_tolstring, newline-terminated) but sends
+	// the result to output_callback instead of stdout. If output capture has
+	// not been enabled (output_callback is empty), the call is a no-op and no
+	// formatting work is done at all - print() output goes nowhere by default.
+	static int captured_print(lua_State* L)
+	{
+		auto* self = *static_cast<Lua**>(lua_getextraspace(L));
+		if(!self || !self->output_callback)
+		{
+			return 0;
+		}
+
+		std::string line;
+		const int n = lua_gettop(L);
+		for(int i = 1; i <= n; ++i)
+		{
+			std::size_t len = 0;
+			const char* s = luaL_tolstring(L, i, &len);
+			if(i > 1)
+			{
+				line += '\t';
+			}
+			line.append(s, len);
+			lua_pop(L, 1); // pop the string luaL_tolstring pushed
+		}
+		line += '\n';
+
+		try
+		{
+			self->output_callback(line);
+		}
+		catch(...)
+		{
+			// Never let a user callback's exception propagate into Lua's C call chain.
+		}
+		return 0;
+	}
 
 	// Builds the typed trampoline closure shared by both expose_func overloads.
 	// `keep_alive` is captured by value inside the closure purely to extend the
@@ -942,10 +1359,18 @@ class Lua final
 	// in this file/CMakeLists.txt), so the split was removed.
 	static int trampoline(lua_State* L)
 	{
+		auto* self = *static_cast<Lua**>(lua_getextraspace(L));
 		auto* weak = static_cast<std::weak_ptr<LuaFunc>*>(lua_touserdata(L, lua_upvalueindex(1)));
 		auto fn = weak->lock();
 		if(!fn)
-			return luaL_error(L, "stale function reference: the registered C++ callable no longer exists");
+		{
+			const char* msg = "stale function reference: the registered C++ callable no longer exists";
+			if(self)
+			{
+				self->log_error(msg);
+			}
+			return luaL_error(L, "%s", msg);
+		}
 
 		try
 		{
@@ -953,6 +1378,10 @@ class Lua final
 		}
 		catch(const std::exception& e)
 		{
+			if(self)
+			{
+				self->log_error(e.what());
+			}
 			return luaL_error(L, "%s", e.what());
 		}
 	}
@@ -1035,7 +1464,13 @@ class Lua final
 		if(duplicate)
 		{
 			lua_pop(L, 2); // restore stack balance before throwing
-			throw std::runtime_error(std::string("method '") + name + "' is already registered on this type");
+			auto msg = std::string("method '") + name + "' is already registered on this type";
+			auto* self = *static_cast<Lua**>(lua_getextraspace(L));
+			if(self)
+			{
+				self->log_error(msg);
+			}
+			throw std::runtime_error(msg);
 		}
 
 		push_weak_upvalue(L, fn);
