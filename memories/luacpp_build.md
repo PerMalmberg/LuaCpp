@@ -145,6 +145,103 @@ across an extern "C" boundary), but it's a warning not an error, doesn't
 fail the build (no /WX on lua_static), and doesn't affect correctness
 (confirmed by the passing tests) - just a nuance worth knowing about.
 
+## Made CMakeLists.txt friendly for library consumption (add_subdirectory)
+
+Rewrote CMakeLists.txt so LuaCpp behaves well as a dependency in a much
+bigger project, not just standalone. Key changes:
+
+1. LUACPP_IS_TOP_LEVEL detection:
+   `if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)`.
+2. New options, all defaulting to LUACPP_IS_TOP_LEVEL (so OFF automatically
+   when included via add_subdirectory/FetchContent):
+   - LUACPP_BUILD_EXAMPLES (build the sample executable)
+   - LUACPP_BUILD_TESTS (fetch Catch2, build+register the test suite)
+   - LUACPP_ENABLE_ASAN (renamed from the too-generic ENABLE_ASAN)
+3. CMAKE_C_STANDARD/CMAKE_CXX_STANDARD/CMAKE_EXPORT_COMPILE_COMMANDS are
+   only set globally when LUACPP_IS_TOP_LEVEL - setting them unconditionally
+   would leak onto every target in a parent project that doesn't override
+   them. Instead, `target_compile_features(lua_static PUBLIC cxx_std_17)`
+   enforces C++17 only for actual consumers of LuaCpp.
+4. Renamed the `main`/`tests` executable targets to `luacpp_example`/
+   `luacpp_tests` - "main" and "tests" are very likely names a consuming
+   project already uses for its own targets; a plain add_subdirectory()
+   would then fail with a duplicate-target-name configure error. Verified
+   this fix by creating a throwaway consumer project that add_subdirectory
+   ()'d LuaCpp AND defined its own targets literally named `main` and
+   `tests` linking against LuaCpp::LuaCpp - configured and built cleanly
+   with zero collisions (and LuaCpp's own luacpp_example/luacpp_tests
+   correctly did NOT get built at all, since the *_BUILD_* options default
+   to OFF when not top-level).
+5. Added a proper consumer-facing target: `LuaCpp::LuaCpp` (ALIAS for a new
+   INTERFACE library `LuaCpp`) that bundles `link against lua_static` +
+   `add src/ (containing Lua.hpp) to the include path` into one line for
+   consumers: `target_link_libraries(your_target PRIVATE LuaCpp::LuaCpp)`.
+   This also transitively carries lua_static's PUBLIC /EHa (MSVC) and
+   cxx_std_17 requirements automatically.
+6. Guarded against duplicate-inclusion / diamond dependencies: wrapped the
+   whole lua_static definition in `if(NOT TARGET lua_static)`, the LuaCpp
+   INTERFACE target in `if(NOT TARGET LuaCpp)`, and the Catch2 fetch in
+   `if(NOT TARGET Catch2::Catch2WithMain)` (in case a parent project
+   already uses Catch2 itself, avoiding a GIT_TAG/version clash).
+7. Renamed the top-level project() name from `lua_project` to `LuaCpp` for
+   clarity (mostly cosmetic - doesn't affect target names).
+8. Dropped `C` from `project(LuaCpp C CXX)` -> `project(LuaCpp CXX)`, and
+   removed the now-dead `CMAKE_C_STANDARD`/`CMAKE_C_STANDARD_REQUIRED`
+   settings. No .c file is ever compiled directly as C anymore - every Lua
+   source goes through the single generated lua_cxx_unity.cpp wrapper,
+   forced to LANGUAGE CXX - so CMake no longer needs to probe for a C
+   compiler at all. Verified: fresh configure no longer prints "-- The C
+   compiler identification is ..."; full rebuild + ctest still 168/168.
+
+Verified: full standalone rebuild still produces `luacpp_example.exe` /
+`luacpp_tests.exe`, ctest still finds and passes all 168 tests unchanged
+(CI's exact commands - `cmake -B build -DCMAKE_BUILD_TYPE=Release` +
+`cmake --build build --config Release` + `ctest --test-dir build -C
+Release` - don't reference target names directly, so nothing needed to
+change there). Also did a live end-to-end test of the add_subdirectory
+consumer scenario described in point 4 above; the consumer's `main.exe`
+(a trivial `#include "Lua.hpp"; int main(){ Lua L; }`) built and ran
+successfully (exit code 0), confirming LuaCpp::LuaCpp works as a drop-in
+dependency.
+
+## Added test coverage for C++ exception handling (was a real gap!)
+
+Despite the whole session revolving around exception-handling correctness
+(trampoline, /EHa, LUA_USE_LONGJMP removal), none of the original 168 tests
+actually threw a C++ exception from inside a registered expose_func/
+expose_method/expose_mutable_method callable - confirmed by grepping
+src/test.cpp for throw/catch/exception (zero hits) before this. Added 9
+new tests (total 177) under a new "[exceptions]" tag, added <stdexcept>
+include:
+- expose_func: std::exception (std::runtime_error) thrown in a callable
+  surfaces as a Lua error via run_script, with the exception's what()
+  message present in the error string.
+- expose_func: same but via lua.call<>() and with std::logic_error (a
+  different std::exception subclass, to confirm the generic
+  catch(const std::exception&) isn't accidentally narrow).
+- expose_func: after a thrown exception, a subsequent call still succeeds
+  (stack-hygiene regression test analogous to the existing "succeeds after
+  an error" tests, but triggered by a genuine C++ throw instead of
+  luaL_error for a bad arg count/type).
+- expose_func: exception thrown mid-call correctly destroys a captured
+  shared_ptr owner (via std::weak_ptr expiry check) - confirms stack
+  unwinding through the trampoline runs destructors normally instead of
+  leaking a reference, the way a raw longjmp would.
+- expose_method: std::exception thrown surfaces as a Lua error; and a
+  stack-hygiene-after-exception test.
+- expose_mutable_method: std::exception thrown surfaces as a Lua error;
+  self is left unmodified in the Lua-side table when the exception is
+  thrown before any mutation happens (guards against partial/corrupt
+  writeback); and a stack-hygiene-after-exception test that also confirms
+  self *does* get mutated correctly on the following successful call.
+
+Verified: full rebuild + ctest passes 177/177 on both the CI-equivalent
+Release flow and the `debug` preset (3x each, no flakiness). Ran the new
+tests in isolation too (`luacpp_tests.exe "[exceptions]" -s`) - 9 test
+cases / 21 assertions, all passed, with error messages showing e.g.
+`[string "boom(-1)"]:1: negative input not allowed` confirming the
+exception's what() text correctly reaches the Lua-visible error string.
+
 ## Other gotchas encountered
 - Lua's headers (lua.h/lauxlib.h/lualib.h) do NOT wrap declarations in
   extern "C" themselves; Lua.hpp already wraps its own #include of them in

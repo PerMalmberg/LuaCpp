@@ -2,6 +2,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <stdexcept>
+
 #include "Lua.hpp"
 
 // ============================================================
@@ -503,6 +505,95 @@ TEST_CASE("expose_func error: wrong argument type", "[expose_func]")
 }
 
 // ============================================================
+// expose_func - C++ exception handling
+// ============================================================
+// The trampoline that dispatches into a registered C++ callable wraps the
+// call in try/catch(const std::exception&) and turns any thrown exception
+// into a Lua error (via luaL_error) carrying the exception's what() message.
+// These tests exercise that path directly, as opposed to the "call error"
+// tests above which cover Lua's own error()/runtime-error mechanism.
+
+TEST_CASE("expose_func: std::exception thrown in C++ callable surfaces as Lua error", "[expose_func][exceptions]")
+{
+	Lua lua;
+	lua.expose_func<int>("boom", std::function<int(int)>(
+	                             [](int x) -> int
+	                             {
+		                             if(x < 0)
+			                             throw std::runtime_error("negative input not allowed");
+		                             return x;
+	                             }));
+
+	auto [ok, err] = lua.run_script("boom(-1)");
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("negative input not allowed"));
+}
+
+TEST_CASE("expose_func: exception thrown in C++ callable surfaces via call<>", "[expose_func][exceptions]")
+{
+	Lua lua;
+	lua.expose_func<int>("boom", std::function<int(int)>(
+	                             [](int x) -> int
+	                             {
+		                             if(x < 0)
+			                             throw std::logic_error("logic_error path");
+		                             return x;
+	                             }));
+
+	auto [ok, err, val] = lua.call<int>("boom", -5);
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("logic_error path"));
+}
+
+TEST_CASE("expose_func: exception does not prevent a subsequent successful call", "[expose_func][exceptions][stack]")
+{
+	// Exercises the same setjmp/longjmp-vs-C++-exception stack-hygiene concern
+	// as the "succeeds after an error" tests above, but triggered by a C++
+	// exception unwinding through the trampoline rather than luaL_error being
+	// called directly for an argument-count/type mismatch.
+	Lua lua;
+	lua.expose_func<int>("boom", std::function<int(int)>(
+	                             [](int x) -> int
+	                             {
+		                             if(x < 0)
+			                             throw std::runtime_error("boom");
+		                             return x;
+	                             }));
+
+	auto [ok1, err1] = lua.run_script("boom(-1)");
+	REQUIRE_FALSE(ok1);
+
+	// Stack must be clean; next call must succeed.
+	auto [ok2, err2, result] = lua.call<int>("boom", 42);
+	REQUIRE(ok2);
+	REQUIRE(result == 42);
+}
+
+TEST_CASE("expose_func: exception thrown mid-call destroys captured shared_ptr owner correctly",
+          "[expose_func][exceptions][lifetime]")
+{
+	// Confirms that when an exception unwinds through the trampoline, any
+	// local C++ objects on that stack frame (here, the locked shared_ptr to
+	// the registered LuaFunc itself) are destroyed via normal C++ stack
+	// unwinding rather than being skipped, as a raw longjmp would do.
+	auto counter = std::make_shared<int>(0);
+	std::weak_ptr<int> weak_counter = counter;
+
+	{
+		Lua lua;
+		lua.expose_func("boom", counter, std::function<void()>([]() { throw std::runtime_error("boom"); }));
+
+		auto [ok, err] = lua.run_script("boom()");
+		REQUIRE_FALSE(ok);
+		REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("boom"));
+		REQUIRE_FALSE(weak_counter.expired()); // lua + our local counter still keep it alive
+	}
+
+	counter.reset();
+	REQUIRE(weak_counter.expired()); // no leaked reference kept by the trampoline
+}
+
+// ============================================================
 // expose_func - stack hygiene
 // ============================================================
 
@@ -913,6 +1004,44 @@ TEST_CASE("expose_method error: wrong argument type", "[expose_method]")
 	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected integer"));
 }
 
+// expose_method - C++ exception handling
+
+TEST_CASE("expose_method: std::exception thrown in C++ callable surfaces as Lua error", "[expose_method][exceptions]")
+{
+	Lua lua;
+	lua.expose_method<Point, int>("safe_div", std::function<int(Point, int)>(
+	                                         [](Point p, int divisor) -> int
+	                                         {
+		                                         if(divisor == 0)
+			                                         throw std::runtime_error("division by zero");
+		                                         return p.x / divisor;
+	                                         }));
+	lua.assign("p", Point{10, 20});
+	auto [ok, err] = lua.run_script("p:safe_div(0)");
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("division by zero"));
+}
+
+TEST_CASE("expose_method: exception does not prevent a subsequent successful call", "[expose_method][exceptions][stack]")
+{
+	Lua lua;
+	lua.expose_method<Point, int>("safe_div", std::function<int(Point, int)>(
+	                                         [](Point p, int divisor) -> int
+	                                         {
+		                                         if(divisor == 0)
+			                                         throw std::runtime_error("division by zero");
+		                                         return p.x / divisor;
+	                                         }));
+	lua.assign("p", Point{10, 20});
+
+	auto [ok1, err1] = lua.run_script("p:safe_div(0)");
+	REQUIRE_FALSE(ok1);
+
+	// Stack must be clean; next call must succeed.
+	auto [ok2, err2] = lua.run_script("assert(p:safe_div(2) == 5)");
+	REQUIRE(ok2);
+}
+
 // expose_method - stack hygiene
 
 TEST_CASE("expose_method stack hygiene: callable multiple times without leak", "[expose_method][stack]")
@@ -1132,6 +1261,72 @@ TEST_CASE("expose_mutable_method error: wrong argument type", "[expose_mutable_m
 	auto [ok, err] = lua.run_script("p:translate('bad', 1)"); // string instead of integer
 	REQUIRE_FALSE(ok);
 	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("expected integer"));
+}
+
+// expose_mutable_method - C++ exception handling
+
+TEST_CASE("expose_mutable_method: std::exception thrown in C++ callable surfaces as Lua error",
+          "[expose_mutable_method][exceptions]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point>("safe_scale", std::function<void(Point&, int)>(
+	                                             [](Point& p, int factor)
+	                                             {
+		                                             if(factor == 0)
+			                                             throw std::runtime_error("scale factor cannot be zero");
+		                                             p.x *= factor;
+		                                             p.y *= factor;
+	                                             }));
+	lua.assign("p", Point{2, 3});
+	auto [ok, err] = lua.run_script("p:safe_scale(0)");
+	REQUIRE_FALSE(ok);
+	REQUIRE_THAT(err, Catch::Matchers::ContainsSubstring("scale factor cannot be zero"));
+}
+
+TEST_CASE("expose_mutable_method: self is left unmodified in Lua when the callable throws before mutating",
+          "[expose_mutable_method][exceptions]")
+{
+	// The callable throws before touching p, so no field writeback should
+	// have happened - guards against the exception path accidentally
+	// running write_struct_back with partially/un-mutated data in a way that
+	// corrupts the Lua-side table.
+	Lua lua;
+	lua.expose_mutable_method<Point>("safe_scale", std::function<void(Point&, int)>(
+	                                             [](Point& p, int factor)
+	                                             {
+		                                             if(factor == 0)
+			                                             throw std::runtime_error("scale factor cannot be zero");
+		                                             p.x *= factor;
+		                                             p.y *= factor;
+	                                             }));
+	lua.assign("p", Point{2, 3});
+	auto [ok, err] = lua.run_script("p:safe_scale(0)");
+	REQUIRE_FALSE(ok);
+
+	auto [ok2, err2] = lua.run_script("assert(p.x == 2 and p.y == 3)");
+	REQUIRE(ok2);
+}
+
+TEST_CASE("expose_mutable_method: exception does not prevent a subsequent successful call",
+          "[expose_mutable_method][exceptions][stack]")
+{
+	Lua lua;
+	lua.expose_mutable_method<Point>("safe_scale", std::function<void(Point&, int)>(
+	                                             [](Point& p, int factor)
+	                                             {
+		                                             if(factor == 0)
+			                                             throw std::runtime_error("scale factor cannot be zero");
+		                                             p.x *= factor;
+		                                             p.y *= factor;
+	                                             }));
+	lua.assign("p", Point{2, 3});
+
+	auto [ok1, err1] = lua.run_script("p:safe_scale(0)");
+	REQUIRE_FALSE(ok1);
+
+	// Stack must be clean; next call must succeed and actually mutate self.
+	auto [ok2, err2] = lua.run_script("p:safe_scale(2); assert(p.x == 4 and p.y == 6)");
+	REQUIRE(ok2);
 }
 
 // expose_mutable_method - stack hygiene
