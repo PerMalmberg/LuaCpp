@@ -491,6 +491,23 @@ class Lua final
 
     std::tuple<bool, std::string> run_script(const char* script)
     {
+        // Lua's own loader (luaL_loadstring/lua_load) transparently accepts
+        // pre-compiled bytecode when the input starts with the bytecode
+        // signature byte '\x1b' ('\27', LUA_SIGNATURE[0]) - it skips the
+        // lexer/parser entirely, so a script string can never be "just text"
+        // in that case. Precompiled chunks are not sandboxed the same way
+        // source is (e.g. crafted bytecode can encode out-of-range constant/
+        // register indices that the parser would never produce, historically
+        // a source of crashes/memory corruption in Lua and other embedders),
+        // so untrusted input must never be allowed to reach the bytecode
+        // loader. Reject it up front, before doing anything else.
+        if(script != nullptr && script[0] == '\x1b')
+        {
+            auto msg = std::string("bytecode not allowed");
+            log_error(msg);
+            return {false, std::move(msg)};
+        }
+
         // Use luaL_loadstring + lua_pcall(L,0,0,0) to discard script return values and prevent stack
         // growth on repeated calls
         if(luaL_loadstring(*this, script) != LUA_OK)

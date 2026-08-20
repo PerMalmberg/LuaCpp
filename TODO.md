@@ -55,13 +55,12 @@
 - [ ] **Read-only C++ globals** (low priority) — attach a `__newindex` metamethod to `_G`
   so scripts cannot overwrite globals set from C++ via `assign`.
 
-- [ ] **Bytecode rejection** (high priority) — `luaL_loadstring` accepts pre-compiled
-  bytecode when the string starts with `\x1b`. Bytecode skips the lexer/parser and can
-  contain crafted instructions. Reject before loading:
-
-  ```cpp
-  if (script[0] == '\x1b') return {false, "bytecode not allowed"};
-  ```
+- [x] **Bytecode rejection** (high priority) — `run_script` now rejects any input
+  beginning with the Lua bytecode signature byte `\x1b` before it ever reaches
+  `luaL_loadstring`, returning `{false, "bytecode not allowed"}` (also reported via
+  `enable_error_logging`, if enabled). Precompiled chunks skip the lexer/parser
+  entirely and can encode indices the parser itself would never produce, so
+  untrusted script strings must never be allowed to reach the bytecode loader.
 
 - [x] **Recursion depth cap** (medium priority) — track call depth manually inside the
   `LUA_MASKCALL` hook; call `lua_error` when depth exceeds a threshold. Prevents

@@ -159,6 +159,16 @@ Executes a Lua string in the current state. Returns `{true, ""}` on success or
 `{false, error_message}` on failure. Globals set during a `run_script` call
 persist for the lifetime of the `Lua` instance.
 
+Any input starting with the Lua bytecode signature byte (`\x1b`) is rejected
+before it reaches Lua's own loader - `run_script` never executes pre-compiled
+bytecode, only source text, since bytecode skips the lexer/parser and can
+encode crafted indices the parser itself would never produce:
+
+```cpp
+auto [ok, err] = lua.run_script(some_untrusted_bytes);
+// ok == false, err == "bytecode not allowed", if some_untrusted_bytes starts with '\x1b'
+```
+
 ---
 
 ### assign

@@ -695,6 +695,20 @@ pre-existing file has NOT been committed/applied yet - only new code added
 this session uses spaces; still pending a decision on whether to do a
 dedicated whitespace-only commit for the rest of the file.
 
+## Documented Script Auditing & Protection hooks in README
+
+Follow-up after the Sandboxing work: added README sections (with TOC
+entries, same style as existing "Exception Handling"/"Sandboxing"
+sections) for every previously-undocumented hook-based feature: Call
+Tracing, Output Capture, Error Logging, Instruction Counting & Limit,
+Recursion Depth Cap, Memory Tracking & Limit. Each has a short usage
+example. Full 225/225 test suite still passes (README-only change,
+no code touched). Committed separately from the Sandboxing commit.
+
+README now has doc coverage for ALL public Lua.hpp features added this
+overall session (hooks + sandboxing), not just Sandboxing/Exception
+Handling as before.
+
 ## Status as of last update
 Simplified to single-unity-TU + /EHa fix, WITHOUT LUA_USE_LONGJMP (Lua
 uses native C++ exceptions for error handling). Verified locally on

@@ -3364,3 +3364,44 @@ TEST_CASE("sandboxing: combining restricted LuaLib construction with sandbox_den
                    "assert(os.time ~= nil)\n"); // still usable
     REQUIRE(ok);
 }
+
+TEST_CASE("bytecode rejection: run_script rejects a string starting with the bytecode signature byte",
+          "[bytecode-rejection]")
+{
+    Lua lua;
+    const char bytecode[] = {'\x1b', 'L', 'u', 'a', '\0'};
+    auto [ok, err] = lua.run_script(bytecode);
+    REQUIRE_FALSE(ok);
+    REQUIRE(err.find("bytecode") != std::string::npos);
+}
+
+TEST_CASE("bytecode rejection: normal Lua source is unaffected", "[bytecode-rejection]")
+{
+    Lua lua;
+    auto [ok, err] = lua.run_script("x = 1 + 1");
+    REQUIRE(ok);
+}
+
+TEST_CASE("bytecode rejection: Lua instance remains usable after a rejected bytecode chunk", "[bytecode-rejection]")
+{
+    Lua lua;
+    const char bytecode[] = {'\x1b', 'j', 'u', 'n', 'k', '\0'};
+    auto [ok1, err1] = lua.run_script(bytecode);
+    REQUIRE_FALSE(ok1);
+
+    auto [ok2, err2] = lua.run_script("y = 2 + 2");
+    REQUIRE(ok2);
+}
+
+TEST_CASE("bytecode rejection: is reported via error logging", "[bytecode-rejection]")
+{
+    Lua lua;
+    std::vector<std::string> logged;
+    lua.enable_error_logging([&](std::string_view s) { logged.emplace_back(s); });
+
+    const char bytecode[] = {'\x1b', 'L', 'u', 'a', '\0'};
+    auto [ok, err] = lua.run_script(bytecode);
+    REQUIRE_FALSE(ok);
+    REQUIRE(logged.size() == 1);
+    REQUIRE(logged[0].find("bytecode") != std::string::npos);
+}
