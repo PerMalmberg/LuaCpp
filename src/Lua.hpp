@@ -622,6 +622,22 @@ class Lua final
         }
     }
 
+    // Bundles multiple std::shared_ptr<Owner> objects into a single
+    // std::tuple, for use with the multi-owner expose_func/expose_method
+    // overloads below. Each owner is kept alive for as long as the
+    // registered closure exists, exactly like the single-owner overloads -
+    // this just extends the mechanism to more than one object at once.
+    //
+    // Example:
+    //   auto sensor = std::make_shared<Sensor>();
+    //   auto logger = std::make_shared<Logger>();
+    //   lua.expose_func<int>("read_sensor", Lua::keep_alive(sensor, logger), func);
+    template <typename... Owners>
+    static std::tuple<std::shared_ptr<Owners>...> keep_alive(std::shared_ptr<Owners>... owners)
+    {
+        return std::make_tuple(std::move(owners)...);
+    }
+
     // Registers a C++ callable as a named Lua global.
     //
     // ReturnTypes - what the function returns to Lua, using the same convention
@@ -658,10 +674,15 @@ class Lua final
     //     referent's lifetime is tied to the registered closure instead.
     //   - Registering a name that already exists as a Lua global silently
     //     replaces it; no warning is produced.
+    //
+    // Implemented in terms of the keep_alive() overload further below (with an
+    // empty owner list) so there is only one real registration code path for
+    // expose_func, regardless of how many owners (zero, one, or several) are
+    // involved.
     template <typename... ReturnTypes, typename... Args>
     void expose_func(const char* name, std::function<lua_return_t<ReturnTypes...>(Args...)> func)
     {
-        register_global_func(name, make_func_wrapper<ReturnTypes...>(std::move(func), NoOwner{}));
+        expose_func<ReturnTypes...>(name, keep_alive(), std::move(func));
     }
 
     // Same as expose_func above, but keeps `owner` alive for as long as the
@@ -670,7 +691,10 @@ class Lua final
     // `func` captures a reference to *owner, or to something owned by it,
     // so the closure can never outlive the referent - the shared_ptr copy
     // captured inside the closure keeps the object alive even if all other
-    // owners release it.
+    // owners release it. Implemented in terms of the keep_alive() overload
+    // below (wraps `owner` in a 1-element tuple) - kept as its own overload
+    // purely so the common single-owner case doesn't require an explicit
+    // keep_alive() call at the use site.
     //
     // Example:
     //   auto sensor = std::make_shared<Sensor>();
@@ -681,7 +705,26 @@ class Lua final
                      std::shared_ptr<Owner> owner,
                      std::function<lua_return_t<ReturnTypes...>(Args...)> func)
     {
-        register_global_func(name, make_func_wrapper<ReturnTypes...>(std::move(func), std::move(owner)));
+        expose_func<ReturnTypes...>(name, keep_alive(std::move(owner)), std::move(func));
+    }
+
+    // Same as expose_func(name, owner, func) above, but keeps MULTIPLE owners
+    // alive for as long as the registered Lua closure exists, for callables
+    // whose captures reference more than one shorter-lived object. Bundle the
+    // owners with the keep_alive() helper below - each is copied by value into
+    // the closure alongside func, exactly like the single-owner overload.
+    //
+    // Example:
+    //   auto sensor = std::make_shared<Sensor>();
+    //   auto logger = std::make_shared<Logger>();
+    //   lua.expose_func<int>("read_sensor", Lua::keep_alive(sensor, logger),
+    //       std::function<int()>([s = sensor.get(), l = logger.get()]{ return s->read() + l->count(); }));
+    template <typename... ReturnTypes, typename... Args, typename... Owners>
+    void expose_func(const char* name,
+                     std::tuple<std::shared_ptr<Owners>...> owners,
+                     std::function<lua_return_t<ReturnTypes...>(Args...)> func)
+    {
+        register_global_func(name, make_func_wrapper<ReturnTypes...>(std::move(func), std::move(owners)));
     }
 
     // Registers a C++ callable as a named method on all Lua instances of StructType.
@@ -726,32 +769,42 @@ class Lua final
     //   - Lambda captures that hold references must outlive the Lua instance.
     //     Value captures are always safe. Use the std::shared_ptr<Owner> overload
     //     below when a reference capture to a shorter-lived object is needed.
+    //
+    // Implemented in terms of the keep_alive() overload further below (with an
+    // empty owner list), the same way as expose_func - see there.
     template <typename StructType, typename... ReturnTypes, typename... Args>
     void expose_method(const char* name, std::function<lua_return_t<ReturnTypes...>(StructType, Args...)> func)
     {
-        static_assert(has_lua_fields<StructType>::value,
-                      "expose_method: StructType must be registered with LUA_REGISTER_STRUCT");
-
-        auto wrapper = make_method_wrapper<StructType, ReturnTypes...>(std::move(func), NoOwner{});
-        std::shared_ptr<LuaFunc> fn(std::move(wrapper));
-        registered_funcs.push_back(fn);
-
-        add_method_to_registry<StructType>(*this, name, fn);
+        expose_method<StructType, ReturnTypes...>(name, keep_alive(), std::move(func));
     }
 
     // Same as expose_method above, but keeps `owner` alive for as long as the
     // registered Lua closure exists. Use this overload whenever `func`
     // captures a reference to *owner, or to something owned by it - see
-    // expose_func(name, owner, func) for the full rationale.
+    // expose_func(name, owner, func) for the full rationale. Implemented in
+    // terms of the keep_alive() overload below, the same way as expose_func.
     template <typename StructType, typename... ReturnTypes, typename... Args, typename Owner>
     void expose_method(const char* name,
                        std::shared_ptr<Owner> owner,
                        std::function<lua_return_t<ReturnTypes...>(StructType, Args...)> func)
     {
+        expose_method<StructType, ReturnTypes...>(name, keep_alive(std::move(owner)), std::move(func));
+    }
+
+    // Same as expose_method(name, owner, func) above, but keeps MULTIPLE owners
+    // alive for as long as the registered method closure exists - see
+    // expose_func's own multi-owner overload and keep_alive() for the
+    // rationale and usage pattern; self/Args are handled the same way as the
+    // single-owner expose_method overload.
+    template <typename StructType, typename... ReturnTypes, typename... Args, typename... Owners>
+    void expose_method(const char* name,
+                       std::tuple<std::shared_ptr<Owners>...> owners,
+                       std::function<lua_return_t<ReturnTypes...>(StructType, Args...)> func)
+    {
         static_assert(has_lua_fields<StructType>::value,
                       "expose_method: StructType must be registered with LUA_REGISTER_STRUCT");
 
-        auto wrapper = make_method_wrapper<StructType, ReturnTypes...>(std::move(func), std::move(owner));
+        auto wrapper = make_method_wrapper<StructType, ReturnTypes...>(std::move(func), std::move(owners));
         std::shared_ptr<LuaFunc> fn(std::move(wrapper));
         registered_funcs.push_back(fn);
 
@@ -854,13 +907,6 @@ class Lua final
     using LuaCloser = std::function<void(lua_State*)>;
     using LuaStatePtr = std::unique_ptr<lua_State, LuaCloser>;
     using LuaFunc = std::function<int(lua_State*)>;
-
-    // Default "keep-alive" object for the expose_func / expose_method overloads
-    // that do not take an explicit owner. Capturing an empty struct by value in
-    // the closure has no runtime cost.
-    struct NoOwner
-    {
-    };
 
     // ---------------------------------------------------------------------------
     // Hook-based auditing/protection state (call tracing, instruction counting,
@@ -1241,11 +1287,13 @@ class Lua final
         return 0;
     }
 
-    // Builds the typed trampoline closure shared by both expose_func overloads.
+    // Builds the typed trampoline closure shared by all expose_func overloads.
     // `keep_alive` is captured by value inside the closure purely to extend the
-    // lifetime of an owning object that `func`'s captures may reference; it is
-    // never otherwise accessed. Pass NoOwner{} when there is nothing to keep
-    // alive - see the expose_func(name, owner, func) overload for the rationale.
+    // lifetime of zero or more owning objects that `func`'s captures may
+    // reference; it is never otherwise accessed. Pass an empty std::tuple<>
+    // (i.e. keep_alive()'s result with no arguments) when there is nothing to
+    // keep alive - see the expose_func(name, owner, func) overload for the
+    // rationale.
     template <typename... ReturnTypes, typename... Args, typename KeepAlive>
     static std::unique_ptr<LuaFunc> make_func_wrapper(std::function<lua_return_t<ReturnTypes...>(Args...)> func,
                                                       KeepAlive keep_alive)

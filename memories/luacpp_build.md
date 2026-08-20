@@ -1113,6 +1113,84 @@ Committed as 786f545. Key content added to item 5:
 
 Docs-only change, no code touched.
 
+## Added multi-owner keep_alive() overloads for expose_func/expose_method,
+## then consolidated all owner-handling into one code path each
+
+Follow-up chain in one session:
+
+1. User asked "Can we make the Owner-overloads take multiple objects?".
+   Added a new public static helper `Lua::keep_alive(shared_ptr<Owners>...)`
+   that bundles owners into a `std::tuple<std::shared_ptr<Owners>...>`, plus
+   new overloads `expose_func(name, tuple<shared_ptr<Owners>...>, func)` and
+   `expose_method(name, tuple<shared_ptr<Owners>...>, func)`. Zero changes
+   needed to `make_func_wrapper`/`make_method_wrapper` - their `KeepAlive`
+   template parameter was already generic and just captures-by-value/never
+   inspects it, so a tuple of shared_ptrs works exactly like a single one.
+   Added `[lifetime]`-tagged tests for both (multi-owner expose_func counter
+   *multiplier scenario; multi-owner expose_method Point logging scenario) -
+   had to move the expose_method test to AFTER `LUA_REGISTER_STRUCT(Point,
+   ...)`'s declaration point in test.cpp (first attempt placed it too early,
+   causing the has_lua_fields<Point> static_assert to fire). Full suite
+   245/245 (up from 243). Documented in README's expose_func section and
+   LIFETIME.md item 1.
+
+2. User asked "Do we really need two overloads for owning?" (single-owner
+   vs multi-owner). Refactored: the single-owner overloads now just forward
+   to the tuple-based ones via `keep_alive(std::move(owner))` (a 1-element
+   tuple), e.g.:
+   ```cpp
+   void expose_func(const char* name, std::shared_ptr<Owner> owner, std::function<...> func)
+   { expose_func<ReturnTypes...>(name, keep_alive(std::move(owner)), std::move(func)); }
+   ```
+   Kept both public signatures (ergonomics: single-owner call sites don't
+   need an explicit keep_alive() wrap) but removed the duplicated
+   registration logic - only the tuple-overload's body actually calls
+   register_global_func/add_method_to_registry now. Verified 245/245 still
+   passing.
+
+3. User asked "Can we get rid of the non-owning overloads?" (the plain
+   expose_func(name, func) with no owner at all). Same trick: the no-owner
+   overloads now forward to the tuple overload with `keep_alive()` called
+   with ZERO arguments (returns an empty `std::tuple<>`, which the generic
+   KeepAlive parameter accepts fine). This let the `NoOwner` sentinel
+   struct (previously a dedicated empty-struct type just to have something
+   inert to capture) be deleted entirely - an empty tuple now serves the
+   same purpose. Result: for both expose_func and expose_method, there is
+   now exactly ONE real registration code path (the tuple/keep_alive()
+   overload); the 0-owner and 1-owner overloads are both thin one-line
+   forwarders. Verified 245/245 still passing, luacpp_example still runs
+   end-to-end (exit 0) with correct output for every demo including
+   sandboxing/exception-handling/error-handling sections.
+
+4. User caught sloppy wording: the README said bundle multiple owners
+   "instead of chaining single-owner calls" - asked "What would that even
+   look like? Could it even be done?". Verified via `register_global_func`/
+   `add_method_to_registry`: a second expose_func/expose_method call under
+   the SAME name does not add an owner to the first closure - it fully
+   REPLACES the registration (overwrites the Lua global / __index entry;
+   the first closure's captured owner becomes orphaned, not merged). So
+   "chaining single-owner calls" was never a real, working alternative -
+   fixed the README wording to state plainly that the single-owner overload
+   can only ever keep one object alive per closure and there is no way to
+   compose two single-owner registrations to cover both; keep_alive() is
+   the only way to bundle more than one owner for one closure.
+
+Net public API shape after all this: `expose_func`/`expose_method` each
+have 3 overloads (no owner / single owner / keep_alive() tuple of owners),
+but only the tuple one contains real logic - the other two are 1-line
+forwarders. `NoOwner` type is gone. Not yet extended to
+`expose_mutable_method`, which still has no owner-overload at all (out of
+scope for these requests).
+
+Also note: at the start of this documentation cleanup thread, discovered
+the repo has BOTH a memory-tool-managed `/memories/luacpp_build.md` (this
+file, outside the repo) AND a separately-tracked, git-committed
+`memories/luacpp_build.md` INSIDE the repo working directory - the two can
+drift out of sync since the tool only edits the former. When asked to
+"include memory in the commit", the fix is to copy this file's current
+content into the repo's `memories/luacpp_build.md` before committing, so
+the two stay in sync at each commit point.
+
 ## Status as of last update
 Simplified to single-unity-TU + /EHa fix, WITHOUT LUA_USE_LONGJMP (Lua
 uses native C++ exceptions for error handling). Verified locally on

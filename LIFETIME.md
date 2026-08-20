@@ -29,10 +29,26 @@ object is released. This does not protect callers who ignore this overload
 and capture a plain reference to a shorter-lived object; the pitfall
 comment on both functions points at this overload as the fix.
 
+Both functions also have a second overload for callables whose captures
+reference **more than one** shorter-lived object: it takes a
+`std::tuple<std::shared_ptr<Owners>...>` in the same position, most
+conveniently built with the `Lua::keep_alive()` helper:
+
+```cpp
+lua.expose_func("read_sensor", Lua::keep_alive(sensor, logger),
+    std::function<int()>([s = sensor.get(), l = logger.get()]{ l->log("read"); return s->read(); }));
+```
+
+Each owner in the tuple is copied by value into the closure exactly like the
+single-owner overload - `make_func_wrapper`/`make_method_wrapper` treat the
+tuple as just another `KeepAlive` value and never inspect it, so it costs
+nothing beyond the copies of the `shared_ptr`s themselves.
+
 See `expose_func`/`expose_method` in `Lua.hpp` and the `[lifetime]`-tagged
 tests in `test.cpp` for the implementation and verification (including a
 test that resets the caller's own `shared_ptr` before invoking the
-registered closure).
+registered closure, and tests covering the multi-owner `keep_alive()`
+overloads).
 
 ---
 

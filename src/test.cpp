@@ -467,6 +467,28 @@ TEST_CASE("expose_func: shared_ptr owner survives after local shared_ptr is rese
     REQUIRE_FALSE(ok2);
 }
 
+TEST_CASE("expose_func: keep_alive() bundles multiple owners, all kept alive", "[expose_func][lifetime]")
+{
+    Lua lua;
+    {
+        auto counter = std::make_shared<int>(0);
+        auto multiplier = std::make_shared<int>(10);
+        lua.expose_func<int>("bump_and_scale", Lua::keep_alive(counter, multiplier),
+                             std::function<int()>([c = counter.get(), m = multiplier.get()]()
+                                                  { return (++(*c)) * (*m); }));
+        // both `counter` and `multiplier` go out of scope here; the closure's
+        // own tuple of shared_ptr copies keeps both objects alive.
+    }
+
+    auto [ok1, err1, r1] = lua.call<int>("bump_and_scale");
+    REQUIRE(ok1);
+    REQUIRE(r1 == 10); // count becomes 1, * multiplier 10
+
+    auto [ok2, err2, r2] = lua.call<int>("bump_and_scale");
+    REQUIRE(ok2);
+    REQUIRE(r2 == 20); // count becomes 2, * multiplier 10
+}
+
 // ============================================================
 // close() - explicit early teardown (LIFETIME.md item 3)
 // ============================================================
@@ -807,6 +829,28 @@ TEST_CASE("expose_method: shared_ptr owner keeps referenced object alive", "[exp
     REQUIRE(log->size() == 2);
     REQUIRE((*log)[0] == 5);
     REQUIRE((*log)[1] == 5);
+}
+
+TEST_CASE("expose_method: keep_alive() bundles multiple owners for a method closure", "[expose_method][lifetime]")
+{
+    Lua lua;
+    auto log = std::make_shared<std::vector<int>>();
+    auto scale = std::make_shared<int>(2);
+
+    lua.expose_method<Point, int>("log_scaled_x", Lua::keep_alive(log, scale),
+                                  std::function<int(Point)>(
+                                  [l = log.get(), s = scale.get()](Point p)
+                                  {
+                                      l->push_back(p.x * (*s));
+                                      return static_cast<int>(l->size());
+                                  }));
+
+    lua.assign("p", Point{3, 4});
+
+    auto [ok, err] = lua.run_script("assert(p:log_scaled_x() == 1)");
+    REQUIRE(ok);
+    REQUIRE(log->size() == 1);
+    REQUIRE((*log)[0] == 6); // 3 * scale(2)
 }
 
 // ============================================================

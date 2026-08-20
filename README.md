@@ -456,8 +456,27 @@ lua.expose_func<int>("read_sensor", sensor,
     std::function<int()>([raw = sensor.get()] { return raw->read(); }));
 ```
 
-The same overload exists for `expose_method`. See [LIFETIME.md](LIFETIME.md)
-for the full rationale and the invariants this relies on.
+If a callable's captures reference **more than one** shorter-lived object,
+bundle them with `Lua::keep_alive()` - the single-owner overload above can
+only keep one object alive per registered closure, and there is no way to
+compose two single-owner registrations to cover both (a second `expose_func`
+call under the same name doesn't add an owner to the first closure, it
+replaces the whole registration). `keep_alive()` bundles as many owners as
+needed into one closure, each kept alive for as long as it is registered:
+
+```cpp
+auto sensor = std::make_shared<Sensor>();
+auto logger = std::make_shared<Logger>();
+lua.expose_func<int>("read_sensor", Lua::keep_alive(sensor, logger),
+    std::function<int()>([s = sensor.get(), l = logger.get()] {
+        l->log("reading sensor");
+        return s->read();
+    }));
+```
+
+The same overloads (single owner and `keep_alive()`) exist for
+`expose_method`. See [LIFETIME.md](LIFETIME.md) for the full rationale and
+the invariants this relies on.
 
 ---
 
