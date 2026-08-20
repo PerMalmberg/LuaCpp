@@ -269,6 +269,40 @@ namespace
         std::cout << "Argument-count error caught: " << std::boolalpha << !ok3 << " - " << err3 << '\n';
     }
 
+    // ---------------------------------------------------------------------------
+    // Sandboxing: restrict which standard libraries a script can see via the
+    // Lua(LuaLib) constructor, and remove individual dangerous globals/fields
+    // from an otherwise-opened library via sandbox_deny.
+    // ---------------------------------------------------------------------------
+    void demo_sandboxing()
+    {
+        print_header("Sandboxing");
+
+        // Only open the libraries this script actually needs - os, io,
+        // require/package, debug, and coroutine are never even opened.
+        Lua lua(LuaLib::Base | LuaLib::Table | LuaLib::String | LuaLib::Math);
+
+        const auto [ok, err] = lua.run_script(R"(
+        print('math.max(3, 7) = ' .. math.max(3, 7))
+        print('os is ' .. tostring(os))
+        print('require is ' .. tostring(require))
+    )");
+        if(!ok)
+            std::cerr << "Lua error: " << err << '\n';
+
+        // A second instance keeps the os library, but removes just os.execute -
+        // demonstrating fine-grained denial within an otherwise-opened library.
+        // LuaCpp ships no built-in denylist; callers decide exactly what to deny.
+        Lua lua2(LuaLib::Base | LuaLib::Table | LuaLib::String | LuaLib::Math | LuaLib::Os);
+        lua2.sandbox_deny("os.execute");
+
+        const auto [ok2, err2] = lua2.run_script("os.execute('true')");
+        std::cout << "os.execute call after sandbox_deny: succeeded? " << std::boolalpha << ok2 << " - " << err2
+                  << '\n';
+        const auto [ok3, err3] = lua2.run_script("assert(os.time ~= nil)");
+        std::cout << "os.time still available? " << std::boolalpha << ok3 << '\n';
+    }
+
 } // namespace
 
 int main()
@@ -282,6 +316,7 @@ int main()
     demo_expose_mutable_method();
     demo_exception_handling();
     demo_error_handling();
+    demo_sandboxing();
 
     return 0;
 }

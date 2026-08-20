@@ -926,6 +926,20 @@ change. Worth double-checking with read_file/rebuild if a similarly
 alarming attachment diff appears again rather than assuming the file is
 actually broken.
 
+## Added demo_sandboxing() to src/main.cpp
+
+Added a new demo function (following the existing one-function-per-feature
+pattern in main.cpp) showcasing the Sandboxing API: an instance constructed
+with a restricted LuaLib set (Base|Table|String|Math - os/io/require/
+package/debug/coroutine never opened), and a second instance that keeps
+LuaLib::Os but denies just "os.execute" via sandbox_deny, confirming
+os.time still works. Wired into main()'s call sequence after
+demo_error_handling(). Verified end-to-end run (exit 0) - note that, like
+every other demo in this file, print() output goes nowhere since none of
+them call enable_output_capture, so only std::cout lines and {ok,err}
+tuples are visible; this is expected/consistent, not a bug. Full 243/243
+test suite unaffected (main.cpp isn't part of the test binary).
+
 ## Status as of last update
 Simplified to single-unity-TU + /EHa fix, WITHOUT LUA_USE_LONGJMP (Lua
 uses native C++ exceptions for error handling). Verified locally on
