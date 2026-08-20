@@ -27,6 +27,12 @@ and from Lua scripts with automatic type checking and clear error messages.
   - [expose\_mutable\_method](#expose_mutable_method)
   - [Exception Handling](#exception-handling)
   - [Sandboxing](#sandboxing)
+  - [Call Tracing](#call-tracing)
+  - [Output Capture](#output-capture)
+  - [Error Logging](#error-logging)
+  - [Instruction Counting \& Limit](#instruction-counting--limit)
+  - [Recursion Depth Cap](#recursion-depth-cap)
+  - [Memory Tracking \& Limit](#memory-tracking--limit)
 - [Gotchas](#gotchas)
 
 ## Requirements
@@ -500,6 +506,167 @@ to remove, based on what your embedding scripts should and shouldn't be able
 to do. `print()` output is unaffected either way; it is always discarded by
 default until `enable_output_capture` is called, no matter which libraries
 are opened.
+
+---
+
+### Call Tracing
+
+```cpp
+lua.enable_call_tracing(cb);   // cb: void(const LuaCallTraceEvent&)
+lua.disable_call_tracing();
+```
+
+Invokes `cb` synchronously on every Lua function call and return while
+tracing is active. `LuaCallTraceEvent` carries a best-effort function `name`
+(`"?"` when Lua can't determine one), `is_call` (`true` for a call/tailcall,
+`false` for a return), and `depth` (call-stack depth, `1` = outermost call).
+Events are **not** retained by the `Lua` instance - only handed to `cb`.
+
+```cpp
+lua.enable_call_tracing([](const LuaCallTraceEvent& e) {
+    std::cout << std::string(e.depth * 2, ' ')
+               << (e.is_call ? "-> " : "<- ") << e.name << '\n';
+});
+lua.run_script("function f() return 1 end f()");
+lua.disable_call_tracing();
+```
+
+An exception thrown by `cb` never aborts the running script - it is caught
+and reported via [Error Logging](#error-logging) instead. Reference captures
+in `cb` must not outlive the `Lua` instance; value captures are always safe.
+
+This shares a single internal `lua_sethook` installation with instruction
+counting/limit and the recursion depth cap, so enabling several of these
+features together composes safely.
+
+---
+
+### Output Capture
+
+```cpp
+lua.enable_output_capture(cb);  // cb: void(std::string_view)
+lua.disable_output_capture();
+```
+
+By default, **`print()` output goes nowhere** - LuaCpp never writes to
+stdout. Call `enable_output_capture` to receive it instead: one call to `cb`
+per `print()` invocation, arguments tab-separated (honouring any
+`__tostring` metamethod) and newline-terminated, matching Lua's own `print`
+formatting.
+
+```cpp
+std::vector<std::string> lines;
+lua.enable_output_capture([&](std::string_view s) { lines.emplace_back(s); });
+lua.run_script("print('hello', 42)");
+// lines == {"hello\t42\n"}
+```
+
+`disable_output_capture()` returns to discarding output - it does **not**
+restore writing to stdout. Independent of [Error Logging](#error-logging):
+enabling one does not affect the other.
+
+---
+
+### Error Logging
+
+```cpp
+lua.enable_error_logging(cb);   // cb: void(std::string_view)
+lua.disable_error_logging();
+```
+
+Reports internal LuaCpp problems that would otherwise be silent or only
+visible via a `{false, msg}` return tuple - e.g. an exception thrown by a
+call-trace callback, a `run_script`/`call<>` failure, or a memory-limit
+breach. Each message is `"[LuaCpp] "`-prefixed and **not** newline-terminated
+- the consumer's callback is responsible for its own line formatting.
+
+```cpp
+std::vector<std::string> logged;
+lua.enable_error_logging([&](std::string_view s) { logged.emplace_back(s); });
+lua.run_script("error('boom')");
+// logged.back() contains "boom"
+```
+
+Completely independent of [Output Capture](#output-capture) - errors can be
+logged without capturing `print()` traffic, and vice versa. By default,
+without a registered callback, these messages are silently dropped.
+
+---
+
+### Instruction Counting & Limit
+
+```cpp
+lua.enable_instruction_counting(period = 1000);
+lua.disable_instruction_counting();
+lua.get_instruction_count();               // std::uint64_t
+
+lua.set_instruction_limit(limit, period = 1000);
+lua.clear_instruction_limit();
+```
+
+`enable_instruction_counting` tracks roughly how many Lua VM instructions
+have executed (an approximation - it advances by `period` each time the
+underlying hook fires, not per exact instruction). `set_instruction_limit`
+adds protection: once the running count reaches `limit`, the next hook
+firing raises a catchable Lua error, aborting the offending script -
+prevents infinite loops and runaway scripts.
+
+```cpp
+lua.set_instruction_limit(100'000);
+auto [ok, err] = lua.run_script("while true do end");
+// ok == false, err contains "instruction limit exceeded"
+```
+
+If both counting and a limit are active simultaneously, the smaller of the
+two requested periods is used for both, since Lua only supports a single
+count-period per state.
+
+---
+
+### Recursion Depth Cap
+
+```cpp
+lua.set_recursion_depth_cap(max_depth);
+lua.clear_recursion_depth_cap();
+```
+
+Once the Lua call-stack depth exceeds `max_depth`, the next call raises a
+catchable Lua error instead of recursing further - prevents a C stack
+overflow via deep (mutual) recursion.
+
+```cpp
+lua.set_recursion_depth_cap(50);
+lua.run_script("function f(n) return f(n+1) end");
+auto [ok, err] = lua.call<int>("f", 0);
+// ok == false, err contains "recursion depth limit exceeded"
+```
+
+---
+
+### Memory Tracking & Limit
+
+```cpp
+lua.get_memory_usage();          // std::size_t, always tracked
+lua.set_memory_limit(bytes);     // 0 (default) = unlimited
+lua.clear_memory_limit();
+```
+
+`get_memory_usage()` reports total bytes currently allocated by this `Lua`
+instance's custom allocator (state, strings, tables, closures - everything,
+not just script-visible data), whether or not a limit is set.
+`set_memory_limit` caps it: once an allocation would push usage over the
+limit, it is refused and Lua raises a catchable "not enough memory" error,
+exactly as it would for a genuine system out-of-memory condition - the state
+is left fully usable afterward.
+
+```cpp
+lua.set_memory_limit(lua.get_memory_usage() + 1024);
+auto [ok, err] = lua.run_script("t = {} for i=1,100000 do t[i] = i end");
+// ok == false, err contains "not enough memory"
+```
+
+Limit breaches (and genuine system OOM) are also reported via
+[Error Logging](#error-logging) if enabled.
 
 ---
 
