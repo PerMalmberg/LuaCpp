@@ -985,6 +985,96 @@ the same conversation (no data lost, no explicit re-approval message
 beyond the user's next instruction), and change #2 (build_type matrix) was
 a separate, separately-committed follow-up request handled the normal way.
 
+## Enforced braces on every if/else/for/while clause, including docs
+
+User request: "Ensure that all code (including code in documentation) uses
+{...} for all clauses, i.e no if(...) single_line_statement;" - a full
+project-wide style sweep, not just newly-touched code (the project's
+existing convention, established earlier this session for close()'s
+`if(closed) return;` fix, was inconsistently applied elsewhere).
+
+Searched src/Lua.hpp, src/main.cpp, src/test.cpp, README.md, TODO.md,
+LIFETIME.md, and CMakeLists.txt via grep for `if(`/`else`/`for(`/`while(`
+followed by an unbraced single statement. Found and fixed:
+
+Lua.hpp (7 spots):
+- read<T>()'s four type-check guards (bool/is_integral/is_floating_point/
+  std::string) - each was `if(!lua_isX(...)) throw ...;` with no braces.
+- Three identical-shaped `if(const int got = lua_gettop(L); got !=
+  expected) throw std::runtime_error(...);` argument-count guards, in
+  make_func_wrapper's lambda, make_method_wrapper's lambda, and
+  expose_mutable_method's inline lambda.
+- decay_for_push's `if constexpr(...) return ...; else return ...;` (both
+  branches unbraced).
+
+main.cpp (6 spots across 5 demo functions): demo_run_script's
+`if(!ok) std::cerr...`; demo_call's `if(ok)...else...` and a second
+`if(ok2)...`; demo_struct_binding's `if(ok)...`; demo_exception_handling's
+`if(b==0) throw...` and `if(ok2)...`; demo_sandboxing's `if(!ok)...`.
+
+test.cpp (12 spots): unbraced `if(x<0) throw ...;` in 3 expose_func
+exception tests, the same pattern in 2 expose_method exception tests, the
+same pattern x3 (identical lambda body reused across 3 TEST_CASEs) in
+expose_mutable_method exception tests (fixed via one replaceAll edit since
+all 3 occurrences were byte-identical), an unbraced `if(b.items.empty())
+return -1;` in the Bag::pop test, and 8 unbraced single-statement for-loop
+bodies (`for(auto x : v) s += x;` etc.) scattered across the
+container-arg/return TEST_CASEs (vector<int>/vector<double>/
+vector<string>/map<string,int>/unordered_map sum/scale/exclaim/dot_sum/
+Bag::sum tests).
+
+README.md (1 spot): the Exception Handling section's example
+`if (b == 0) throw std::runtime_error(...);` inside a ```cpp block.
+
+Deliberately did NOT touch: LIFETIME.md's `if(!fn) { /* comment */ }` -
+already has braces (just compact/inline), satisfies the actual
+requirement even though not multi-line. Also did NOT touch CMakeLists.txt
+- its `if()`/`endif()` pairs are CMake's own language syntax, unrelated to
+C++ brace style, and every one already has a matching `endif()` regardless
+of formatting. Also explicitly excluded build/_deps/catch2-src (vendored
+third-party dependency, not this project's own code) from the sweep.
+
+Verified via rebuild: full 243/243 test suite still passes, and
+luacpp_example's stdout was diffed byte-for-byte against a
+pre-change-captured baseline and found IDENTICAL - confirms this was a
+pure formatting/style pass with zero behavioral change, as expected.
+
+## Docs cleanup: removed historical/past-tense narrative from LIFETIME.md,
+## CMakeLists.txt, and Lua.hpp comments (current-state only)
+
+User asked that documentation and code comments describe only *current*
+state, not the history of what used to be true. Rewrote/edited:
+
+- `LIFETIME.md`: full rewrite. Removed "Status: Resolved/Implemented/
+  Documented" labels, the item-2 "Historical bug (no longer applicable)"
+  paragraph describing the old trampoline_impl/call_impl split and the
+  since-removed setjmp/longjmp-era bug, and "has since been removed"/
+  "originally"/"previously" phrasing throughout. Kept all still-relevant
+  technical facts (weak_ptr trampoline, close() GC double-collect,
+  self-by-value pitfalls, coroutine risk) phrased as plain current-state
+  descriptions ("Mitigation:" instead of "Status: Implemented.").
+- `CMakeLists.txt`: reworded 3 comment blocks that referenced the old
+  per-file-wrapper Windows-crash theory ("originally suspected... turned
+  out to be a red herring"), the old LUA_USE_LONGJMP-because-of-Windows-
+  crashes rationale ("we previously forced... those crashes were actually
+  caused by..."), and "as an earlier version of this file did" (re: global
+  CMAKE_CXX_FLAGS mutation) - now state only why the current single-TU +
+  /EHa + no-LUA_USE_LONGJMP design is correct, without the backstory.
+- `src/Lua.hpp`: trampoline() comment had a paragraph starting "This used
+  to be split into trampoline()/trampoline_impl()/call_impl()... Neither
+  condition applies anymore... so the split was removed" - trimmed to just
+  the current-state safety rationale (relies on /EHa + no LUA_USE_LONGJMP).
+- Checked `README.md`, `TODO.md`, `src/test.cpp` for the same kind of
+  language (grepped for previously/historical/no longer/used to/has since/
+  originally/already/Real bug caught/Status:) - README.md and test.cpp had
+  none; TODO.md's checked-off `[x]` items already read as pure
+  current-state implementation descriptions (no rewrite needed there).
+
+Verified: rebuilt (`cmake --build build`) after all edits - clean build,
+comment-only changes, no functional/test impact (didn't re-run full ctest
+since nothing but comments/markdown changed, but confirmed compile-clean
+for lua_static/luacpp_example/luacpp_tests).
+
 ## Status as of last update
 Simplified to single-unity-TU + /EHa fix, WITHOUT LUA_USE_LONGJMP (Lua
 uses native C++ exceptions for error handling). Verified locally on

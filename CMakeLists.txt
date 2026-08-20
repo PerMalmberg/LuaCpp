@@ -84,14 +84,10 @@ if(NOT TARGET lua_static)
   # that consumes the C-linkage declarations.
   #
   # We generate a single unity/amalgamated wrapper .cpp that #includes every
-  # Lua .c source inside one `extern "C" { ... }` block. This was originally
-  # suspected of causing Windows STATUS_HEAP_CORRUPTION crashes in Lua's
-  # error-handling tests (luaL_error / longjmp paths), and was replaced with
-  # one wrapper-per-source-file as a workaround. That turned out to be a red
-  # herring: the actual cause was MSVC's default /EHsc exception model being
-  # unsafe to mix with setjmp/longjmp (see the /EHa fix above). With /EHa in
-  # place, the simple single-TU approach below builds and passes all tests
-  # reliably on Windows, Linux and macOS, so we keep it for its simplicity.
+  # Lua .c source inside one `extern "C" { ... }` block. This single-TU
+  # approach builds and passes all tests reliably on Windows, Linux and
+  # macOS (Windows correctness depends on the /EHa flag applied to
+  # lua_static below), and is kept for its simplicity.
   set(LUA_CXX_WRAPPER_DIR "${CMAKE_BINARY_DIR}/generated/lua_cxx")
   file(MAKE_DIRECTORY ${LUA_CXX_WRAPPER_DIR})
 
@@ -115,14 +111,9 @@ if(NOT TARGET lua_static)
   # exception (LUAI_THROW/LUAI_TRY -> throw/catch(...) at the lua_pcall
   # boundary). This is Lua's own documented/supported mechanism for
   # embedding in C++ and, unlike raw longjmp, properly unwinds the C++ stack
-  # and runs destructors. We previously forced classic setjmp/longjmp via
-  # LUA_USE_LONGJMP because of Windows STATUS_HEAP_CORRUPTION crashes - but
-  # those crashes were actually caused by MSVC's /EHsc exception model being
-  # incompatible with longjmp (see the /EHa fix above), not by the C++
-  # exception mode itself. Now that /EHa is applied project-wide, Lua's
-  # native C++ exception-based error handling works reliably (verified with
-  # repeated Release and Debug ctest runs on Windows with no flakiness).
-  # (Intentionally NOT setting LUA_USE_LONGJMP here.)
+  # and runs destructors. This project relies on that behavior, together
+  # with the /EHa flag applied to lua_static below (required for this to be
+  # safe on MSVC), so LUA_USE_LONGJMP is intentionally never defined here.
 
   # Platform-specific Lua defines and system libraries.
   # lua.c (the interactive REPL) is excluded from the build so LUA_USE_READLINE
@@ -142,10 +133,9 @@ if(NOT TARGET lua_static)
     #
     # PUBLIC (not PRIVATE) is essential here: this project is meant to be
     # consumed as a library (via add_subdirectory/FetchContent/find_package)
-    # from a much larger project. A PRIVATE flag, or mutating the global
-    # CMAKE_CXX_FLAGS as an earlier version of this file did, only affects
-    # translation units built inside THIS CMakeLists.txt - it does not reach
-    # the consumer's own targets that #include Lua.hpp and call into it. By
+    # from a much larger project. A PRIVATE flag only affects translation
+    # units built inside THIS CMakeLists.txt - it does not reach the
+    # consumer's own targets that #include Lua.hpp and call into it. By
     # attaching /EHa (and /bigobj, needed because /EHa generates more unwind
     # metadata) as a PUBLIC usage requirement on lua_static, CMake
     # automatically appends both flags to the compile command line of any

@@ -1773,13 +1773,9 @@ class Lua final
     // in ldo.c) rather than a raw longjmp. A real C++ throw correctly unwinds
     // this frame - including running fn's destructor - and is safe to
     // propagate through an unrelated try/catch(const std::exception&) block
-    // regardless of the compiler's exception model (/EHsc or /EHa). This used
-    // to be split into trampoline()/trampoline_impl()/call_impl() to keep
-    // lua_error() out of any frame with a live try/catch, back when Lua used
-    // setjmp/longjmp for errors and MSVC's default /EHsc made longjmp-across-
-    // try/catch corrupt the SEH handler chain. Neither condition applies
-    // anymore (see the /EHa fix and the removal of LUA_USE_LONGJMP elsewhere
-    // in this file/CMakeLists.txt), so the split was removed.
+    // regardless of the compiler's exception model (/EHsc or /EHa), given the
+    // /EHa flag applied to lua_static in CMakeLists.txt and the absence of
+    // LUA_USE_LONGJMP.
     static int trampoline(lua_State* L)
     {
         auto* self = *static_cast<Lua**>(lua_getextraspace(L));
