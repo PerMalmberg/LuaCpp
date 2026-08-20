@@ -812,8 +812,10 @@ class Lua final
             constexpr int n_method_args = static_cast<int>(sizeof...(Args));
             constexpr int expected = n_method_args + 1; // +1 for implicit self
             if(const int got = lua_gettop(L); got != expected)
+            {
                 throw std::runtime_error("expected " + std::to_string(n_method_args) + " argument(s), got " +
                                          std::to_string(got - 1));
+            }
 
             auto self = read<StructType>(L, 1);
             auto extra_args = collect_args_from<Args...>(L, 2, std::index_sequence_for<Args...>{});
@@ -1257,8 +1259,10 @@ class Lua final
             (void)keep_alive; // captured only to extend the owner's lifetime
             constexpr int expected = static_cast<int>(sizeof...(Args));
             if(const int got = lua_gettop(L); got != expected)
+            {
                 throw std::runtime_error("expected " + std::to_string(expected) + " argument(s), got " +
                                          std::to_string(got));
+            }
 
             auto args = collect_args_from<Args...>(L, 1, std::index_sequence_for<Args...>{});
 
@@ -1312,8 +1316,10 @@ class Lua final
             constexpr int n_method_args = static_cast<int>(sizeof...(Args));
             constexpr int expected = n_method_args + 1; // +1 for implicit self
             if(const int got = lua_gettop(L); got != expected)
+            {
                 throw std::runtime_error("expected " + std::to_string(n_method_args) + " argument(s), got " +
                                          std::to_string(got - 1));
+            }
 
             auto self = read<StructType>(L, 1);
             auto args = collect_args_from<Args...>(L, 2, std::index_sequence_for<Args...>{});
@@ -1500,7 +1506,9 @@ class Lua final
         if constexpr(std::is_same_v<T, bool>)
         {
             if(!lua_isboolean(L, index))
+            {
                 throw std::runtime_error("expected boolean, got " + actual);
+            }
             return lua_toboolean(L, index) != 0;
         }
         else if constexpr(std::is_integral_v<T>)
@@ -1509,7 +1517,9 @@ class Lua final
             // such as 1.0. Use a floating-point ReturnType if the Lua expression
             // may yield a float.
             if(!lua_isinteger(L, index))
+            {
                 throw std::runtime_error("expected integer, got " + actual);
+            }
             return static_cast<T>(lua_tointeger(L, index));
         }
         else if constexpr(std::is_floating_point_v<T>)
@@ -1517,7 +1527,9 @@ class Lua final
             // lua_isnumber returns true for Lua integers as well as floats, so
             // integer values are silently widened to the C++ floating-point type.
             if(!lua_isnumber(L, index))
+            {
                 throw std::runtime_error("expected number, got " + actual);
+            }
             return static_cast<T>(lua_tonumber(L, index));
         }
         else if constexpr(std::is_same_v<T, std::string>)
@@ -1528,7 +1540,9 @@ class Lua final
             // length is obtained; this preserves embedded null bytes that
             // std::string{lua_tostring(...)} would otherwise truncate.
             if(!lua_isstring(L, index))
+            {
                 throw std::runtime_error("expected string, got " + actual);
+            }
             std::size_t len = 0;
             const char* ptr = lua_tolstring(L, index, &len);
             return {ptr, len};
@@ -1664,9 +1678,13 @@ class Lua final
     static decltype(auto) decay_for_push(T&& value)
     {
         if constexpr(std::is_array_v<std::remove_reference_t<T>>)
+        {
             return static_cast<std::decay_t<std::remove_reference_t<T>>>(std::forward<T>(value));
+        }
         else
+        {
             return std::forward<T>(value);
+        }
     }
 
     // Reads N typed arguments from the Lua stack starting at position `base`.

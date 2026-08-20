@@ -588,7 +588,9 @@ TEST_CASE("expose_func: std::exception thrown in C++ callable surfaces as Lua er
                                  [](int x) -> int
                                  {
                                      if(x < 0)
+                                     {
                                          throw std::runtime_error("negative input not allowed");
+                                     }
                                      return x;
                                  }));
 
@@ -604,7 +606,9 @@ TEST_CASE("expose_func: exception thrown in C++ callable surfaces via call<>", "
                                  [](int x) -> int
                                  {
                                      if(x < 0)
+                                     {
                                          throw std::logic_error("logic_error path");
+                                     }
                                      return x;
                                  }));
 
@@ -624,7 +628,9 @@ TEST_CASE("expose_func: exception does not prevent a subsequent successful call"
                                  [](int x) -> int
                                  {
                                      if(x < 0)
+                                     {
                                          throw std::runtime_error("boom");
+                                     }
                                      return x;
                                  }));
 
@@ -1081,7 +1087,9 @@ TEST_CASE("expose_method: std::exception thrown in C++ callable surfaces as Lua 
                                               [](Point p, int divisor) -> int
                                               {
                                                   if(divisor == 0)
+                                                  {
                                                       throw std::runtime_error("division by zero");
+                                                  }
                                                   return p.x / divisor;
                                               }));
     lua.assign("p", Point{10, 20});
@@ -1098,7 +1106,9 @@ TEST_CASE("expose_method: exception does not prevent a subsequent successful cal
                                               [](Point p, int divisor) -> int
                                               {
                                                   if(divisor == 0)
+                                                  {
                                                       throw std::runtime_error("division by zero");
+                                                  }
                                                   return p.x / divisor;
                                               }));
     lua.assign("p", Point{10, 20});
@@ -1342,7 +1352,9 @@ TEST_CASE("expose_mutable_method: std::exception thrown in C++ callable surfaces
                                                    [](Point& p, int factor)
                                                    {
                                                        if(factor == 0)
+                                                       {
                                                            throw std::runtime_error("scale factor cannot be zero");
+                                                       }
                                                        p.x *= factor;
                                                        p.y *= factor;
                                                    }));
@@ -1364,7 +1376,9 @@ TEST_CASE("expose_mutable_method: self is left unmodified in Lua when the callab
                                                    [](Point& p, int factor)
                                                    {
                                                        if(factor == 0)
+                                                       {
                                                            throw std::runtime_error("scale factor cannot be zero");
+                                                       }
                                                        p.x *= factor;
                                                        p.y *= factor;
                                                    }));
@@ -1384,7 +1398,9 @@ TEST_CASE("expose_mutable_method: exception does not prevent a subsequent succes
                                                    [](Point& p, int factor)
                                                    {
                                                        if(factor == 0)
+                                                       {
                                                            throw std::runtime_error("scale factor cannot be zero");
+                                                       }
                                                        p.x *= factor;
                                                        p.y *= factor;
                                                    }));
@@ -1773,7 +1789,9 @@ TEST_CASE("expose_func: vector<int> arg", "[expose_func][vector]")
                                     {
                                         int s = 0;
                                         for(auto x : v)
+                                        {
                                             s += x;
+                                        }
                                         return s;
                                     }));
     auto [ok, err, result] = lua.call<int>("vec_sum", std::vector<int>{1, 2, 3, 4});
@@ -1789,7 +1807,9 @@ TEST_CASE("expose_func: vector<int> return", "[expose_func][vector]")
                                                {
                                                    std::vector<int> v;
                                                    for(int i = 1; i <= n; ++i)
+                                                   {
                                                        v.push_back(i);
+                                                   }
                                                    return v;
                                                }));
     auto [ok, err, result] = lua.call<std::vector<int>>("range", 4);
@@ -1804,7 +1824,9 @@ TEST_CASE("expose_func: vector<double> arg and return", "[expose_func][vector]")
                                                       [](std::vector<double> v, double f)
                                                       {
                                                           for(auto& x : v)
+                                                          {
                                                               x *= f;
+                                                          }
                                                           return v;
                                                       }));
     auto [ok, err, result] = lua.call<std::vector<double>>("scale_vec", std::vector<double>{1.0, 2.0, 4.0}, 2.5);
@@ -1822,7 +1844,9 @@ TEST_CASE("expose_func: vector<string> arg and return", "[expose_func][vector]")
                                               [](std::vector<std::string> v)
                                               {
                                                   for(auto& s : v)
+                                                  {
                                                       s += "!";
+                                                  }
                                                   return v;
                                               }));
     auto [ok, err, result] = lua.call<std::vector<std::string>>("exclaim", std::vector<std::string>{"hi", "bye"});
@@ -1858,7 +1882,9 @@ TEST_CASE("expose_func: map<string,int> arg", "[expose_func][map]")
                                     {
                                         int s = 0;
                                         for(auto& [k, v] : m)
+                                        {
                                             s += v;
+                                        }
                                         return s;
                                     }));
     auto [ok, err, result] = lua.call<int>("map_sum", std::map<std::string, int>{{"a", 1}, {"b", 2}, {"c", 3}});
@@ -1888,7 +1914,9 @@ TEST_CASE("expose_func: unordered_map<string,int> arg and return", "[expose_func
                                                           [](std::unordered_map<std::string, int> m)
                                                           {
                                                               for(auto& [k, v] : m)
+                                                              {
                                                                   v = -v;
+                                                              }
                                                               return m;
                                                           }));
     std::unordered_map<std::string, int> input{{"x", 5}, {"y", 10}};
@@ -1964,7 +1992,9 @@ TEST_CASE("expose_method: vector<Point> arg", "[expose_method][vector][struct]")
                                              {
                                                  int s = 0;
                                                  for(auto& o : others)
+                                                 {
                                                      s += p.x * o.x + p.y * o.y;
+                                                 }
                                                  return s;
                                              }));
     lua.assign("p", Point{1, 2});
@@ -2000,7 +2030,9 @@ TEST_CASE("expose_method: Bag::sum - method on struct with vector field", "[expo
                                        {
                                            int s = 0;
                                            for(auto x : b.items)
+                                           {
                                                s += x;
+                                           }
                                            return s;
                                        }));
     lua.assign("b", Bag{{1, 2, 3, 4}});
@@ -2056,7 +2088,9 @@ TEST_CASE("expose_mutable_method: Bag::pop - scalar return plus vector mutation"
                                                [](Bag& b)
                                                {
                                                    if(b.items.empty())
+                                                   {
                                                        return -1;
+                                                   }
                                                    int v = b.items.back();
                                                    b.items.pop_back();
                                                    return v;

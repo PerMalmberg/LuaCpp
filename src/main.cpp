@@ -53,7 +53,9 @@ namespace
         Lua lua;
         const auto [ok, err] = lua.run_script("print('Hello from Lua ' .. _VERSION)");
         if(!ok)
+        {
             std::cerr << "Lua error: " << err << '\n';
+        }
 
         // Globals set by one run_script call persist for later calls on the same
         // Lua instance.
@@ -104,13 +106,19 @@ namespace
         // Multiple return values.
         const auto [ok, err, label, sum] = lua.call<std::string, int>("add", 3, 4);
         if(ok)
+        {
             std::cout << label << " " << sum << '\n';
+        }
         else
+        {
             std::cerr << "Lua error: " << err << '\n';
+        }
 
         const auto [ok2, err2, lo, hi] = lua.call<int, int>("minmax", 7, 3);
         if(ok2)
+        {
             std::cout << "min=" << lo << " max=" << hi << '\n';
+        }
 
         // Calling a function purely for its side effect (no ReturnTypes, no result
         // captured beyond ok/err).
@@ -134,7 +142,9 @@ namespace
         lua.run_script("function make_point() return {x = 5, y = 6} end");
         const auto [ok, err, p] = lua.call<Point>("make_point");
         if(ok)
+        {
             std::cout << "Point built from a Lua table literal: (" << p.x << ',' << p.y << ")\n";
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -235,7 +245,9 @@ namespace
                                          [](int a, int b) -> int
                                          {
                                              if(b == 0)
+                                             {
                                                  throw std::runtime_error("division by zero");
+                                             }
                                              return a / b;
                                          }));
 
@@ -245,7 +257,9 @@ namespace
         // The Lua state remains fully usable after a thrown exception.
         const auto [ok2, err2, result] = lua.call<int>("safe_div", 10, 2);
         if(ok2)
+        {
             std::cout << "safe_div(10, 2) = " << result << '\n';
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -288,7 +302,9 @@ namespace
         print('require is ' .. tostring(require))
     )");
         if(!ok)
+        {
             std::cerr << "Lua error: " << err << '\n';
+        }
 
         // A second instance keeps the os library, but removes just os.execute -
         // demonstrating fine-grained denial within an otherwise-opened library.

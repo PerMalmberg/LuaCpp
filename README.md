@@ -553,7 +553,9 @@ normally.
 lua.expose_func<int>("safe_div",
     std::function<int(int, int)>([](int a, int b) {
         if (b == 0)
+        {
             throw std::runtime_error("division by zero");
+        }
         return a / b;
     }));
 
