@@ -52,8 +52,17 @@
   isn't opened, so it composes safely with constructor-level exclusion. LuaCpp does
   not ship a built-in denylist — callers choose exactly which names to remove.
 
-- [ ] **Read-only C++ globals** (low priority) — attach a `__newindex` metamethod to `_G`
-  so scripts cannot overwrite globals set from C++ via `assign`.
+- [x] **Read-only C++ globals** (low priority) — implemented via a permanently-empty
+  proxy table installed as the real Lua globals table (`LUA_RIDX_GLOBALS`); its
+  `__index`/`__newindex` metamethods transparently forward reads to, and gate writes
+  against, the real globals table (kept reachable via a private registry key). Every
+  name registered via `assign`/`expose_func` is automatically inserted into an internal
+  protected-name set; a script-side write to a protected name raises a catchable Lua
+  error ("attempt to modify protected global '...'", also reported via
+  `enable_error_logging`) instead of silently succeeding. `protect_global`/
+  `unprotect_global` let a caller extend or lift protection for any specific name.
+  Reads of protected globals, and writes to any other (unprotected) name, are
+  completely unaffected.
 
 - [x] **Bytecode rejection** (high priority) — `run_script` now rejects any input
   beginning with the Lua bytecode signature byte `\x1b` before it ever reaches

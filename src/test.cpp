@@ -3405,3 +3405,127 @@ TEST_CASE("bytecode rejection: is reported via error logging", "[bytecode-reject
     REQUIRE(logged.size() == 1);
     REQUIRE(logged[0].find("bytecode") != std::string::npos);
 }
+
+TEST_CASE("read-only globals: script cannot overwrite an assign()-registered global", "[read-only-globals]")
+{
+    Lua lua;
+    lua.assign("count", 10);
+
+    auto [ok, err] = lua.run_script("count = 20");
+    REQUIRE_FALSE(ok);
+    REQUIRE(err.find("protected global") != std::string::npos);
+    REQUIRE(err.find("count") != std::string::npos);
+
+    // The original value is untouched, and the state remains usable.
+    auto [ok3, err3] = lua.run_script("assert(count == 10)");
+    REQUIRE(ok3);
+}
+
+TEST_CASE("read-only globals: script cannot overwrite an expose_func-registered global", "[read-only-globals]")
+{
+    Lua lua;
+    lua.expose_func<int>("add", std::function<int(int, int)>([](int a, int b) { return a + b; }));
+
+    auto [ok, err] = lua.run_script("add = nil");
+    REQUIRE_FALSE(ok);
+    REQUIRE(err.find("protected global") != std::string::npos);
+
+    auto [ok2, err2, r] = lua.call<int>("add", 3, 4);
+    REQUIRE(ok2);
+    REQUIRE(r == 7);
+}
+
+TEST_CASE("read-only globals: reading a protected global is unaffected", "[read-only-globals]")
+{
+    Lua lua;
+    lua.assign("count", 42);
+
+    auto [ok, err] = lua.run_script("assert(count == 42)");
+    REQUIRE(ok);
+}
+
+TEST_CASE("read-only globals: unrelated globals set by scripts remain freely writable", "[read-only-globals]")
+{
+    Lua lua;
+    lua.assign("count", 1);
+
+    auto [ok, err] = lua.run_script("y = 1 y = 2 y = 3");
+    REQUIRE(ok);
+
+    auto [ok2, err2] = lua.run_script("assert(y == 3)");
+    REQUIRE(ok2);
+}
+
+TEST_CASE("read-only globals: unprotect_global allows script-side overwrite again", "[read-only-globals]")
+{
+    Lua lua;
+    lua.assign("count", 1);
+    lua.unprotect_global("count");
+
+    auto [ok, err] = lua.run_script("count = 99");
+    REQUIRE(ok);
+
+    auto [ok2, err2] = lua.run_script("assert(count == 99)");
+    REQUIRE(ok2);
+}
+
+TEST_CASE("read-only globals: protect_global protects a global set from Lua itself", "[read-only-globals]")
+{
+    Lua lua;
+    auto [ok0, err0] = lua.run_script("secret = 1");
+    REQUIRE(ok0);
+    lua.protect_global("secret");
+
+    auto [ok, err] = lua.run_script("secret = 2");
+    REQUIRE_FALSE(ok);
+    REQUIRE(err.find("protected global") != std::string::npos);
+}
+
+TEST_CASE("read-only globals: protection is reported via error logging", "[read-only-globals]")
+{
+    Lua lua;
+    lua.assign("count", 1);
+
+    std::vector<std::string> logged;
+    lua.enable_error_logging([&](std::string_view s) { logged.emplace_back(s); });
+
+    auto [ok, err] = lua.run_script("count = 2");
+    REQUIRE_FALSE(ok);
+    // Two entries, by design (same pattern as the expose_func exception
+    // double-log case): protected_newindex logs the raw "attempt to modify
+    // protected global ..." message directly, and run_script's own Tier-2
+    // error-logging site logs the resulting Lua error string (which also
+    // contains that same text) after lua_pcall fails.
+    REQUIRE(logged.size() == 2);
+    REQUIRE(logged[0].find("protected global") != std::string::npos);
+    REQUIRE(logged[1].find("protected global") != std::string::npos);
+}
+
+TEST_CASE("read-only globals: close() un-protects and nils expose_func-registered globals", "[read-only-globals]")
+{
+    Lua lua;
+    lua.expose_func<int>("add", std::function<int(int, int)>([](int a, int b) { return a + b; }));
+    lua.close();
+
+    auto [ok, err] = lua.run_script("add = 5"); // no longer protected - safe to overwrite post-close
+    REQUIRE(ok);
+}
+
+TEST_CASE("read-only globals: sandbox_deny on a bare name un-protects and nils it", "[read-only-globals]")
+{
+    Lua lua;
+    lua.assign("blocked", 1);
+    lua.sandbox_deny("blocked");
+
+    auto [ok, err] = lua.run_script("assert(blocked == nil)\nblocked = 5");
+    REQUIRE(ok);
+}
+
+TEST_CASE("read-only globals: normal stdlib usage is unaffected by the proxy", "[read-only-globals]")
+{
+    Lua lua;
+    auto [ok, err] = lua.run_script("assert(math.max(1,2,3) == 3)\n"
+                                    "assert(string.upper('a') == 'A')\n"
+                                    "local t = {} for i=1,5 do t[i]=i end assert(#t == 5)\n");
+    REQUIRE(ok);
+}

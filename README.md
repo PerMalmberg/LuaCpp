@@ -33,6 +33,7 @@ and from Lua scripts with automatic type checking and clear error messages.
   - [Instruction Counting \& Limit](#instruction-counting--limit)
   - [Recursion Depth Cap](#recursion-depth-cap)
   - [Memory Tracking \& Limit](#memory-tracking--limit)
+  - [Read-Only C++ Globals](#read-only-c-globals)
 - [Gotchas](#gotchas)
 
 ## Requirements
@@ -677,6 +678,42 @@ auto [ok, err] = lua.run_script("t = {} for i=1,100000 do t[i] = i end");
 
 Limit breaches (and genuine system OOM) are also reported via
 [Error Logging](#error-logging) if enabled.
+
+---
+
+### Read-Only C++ Globals
+
+Every global registered via `assign()` or `expose_func()` is automatically
+protected from being overwritten by Lua code:
+
+```cpp
+lua.assign("count", 10);
+
+auto [ok, err] = lua.run_script("count = 20");
+// ok == false, err contains "attempt to modify protected global 'count'"
+
+auto [ok2, err2] = lua.run_script("assert(count == 10)"); // untouched
+// ok2 == true
+```
+
+Only **writes** are affected - reading a protected global from Lua works
+exactly as normal. Globals that were never registered via `assign`/
+`expose_func` (including ones a script sets itself, e.g. `y = 1`) remain
+freely writable by default.
+
+Use `protect_global`/`unprotect_global` to adjust protection for a specific
+name:
+
+```cpp
+lua.run_script("secret = 1");
+lua.protect_global("secret");   // now also protected, even though it was set from Lua
+
+lua.assign("count", 10);
+lua.unprotect_global("count"); // opt this one back out - scripts may overwrite it again
+```
+
+Protection violations are also reported via [Error Logging](#error-logging)
+if enabled.
 
 ---
 

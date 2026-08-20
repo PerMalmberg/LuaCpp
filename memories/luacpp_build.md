@@ -709,6 +709,35 @@ README now has doc coverage for ALL public Lua.hpp features added this
 overall session (hooks + sandboxing), not just Sandboxing/Exception
 Handling as before.
 
+## Implemented: Bytecode rejection in run_script
+
+Added a check at the very top of run_script(): if `script[0] == '\x1b'`
+(the Lua bytecode signature byte, LUA_SIGNATURE[0]), immediately return
+`{false, "bytecode not allowed"}` (also routed through log_error) WITHOUT
+calling luaL_loadstring at all. Rationale documented inline: luaL_loadstring/
+lua_load transparently accept precompiled bytecode when input starts with
+that byte, skipping the lexer/parser entirely - precompiled chunks can
+encode out-of-range constant/register indices the parser itself would never
+produce, a known source of crashes/memory corruption in Lua embedders, so
+untrusted script strings must never reach the bytecode loader.
+
+Only run_script() needed this - call<>() only invokes already-loaded Lua
+functions by name (lua_getglobal + lua_pcall), it never loads a raw string,
+so there's no separate bytecode-loading path to guard there.
+
+Added 4 tests (`[bytecode-rejection]` tag): a string starting with '\x1b' is
+rejected with "bytecode" in the message, normal source is unaffected, the
+Lua instance remains usable after a rejected chunk, and the rejection is
+also reported via enable_error_logging (exactly 1 log entry). Full suite
+now 229/229 passing. Updated TODO.md (checked off) and README.md (new
+paragraph + example under the existing "run_script" section, not a new
+top-level section, since it's a behavior of an existing method not a new
+API surface). Verified `luacpp_example` still runs end-to-end (exit 0).
+
+Remaining unimplemented TODO.md item: "Read-only C++ globals" (attach a
+__newindex metamethod to _G so scripts can't overwrite C++-set globals) -
+low priority, not yet started.
+
 ## Status as of last update
 Simplified to single-unity-TU + /EHa fix, WITHOUT LUA_USE_LONGJMP (Lua
 uses native C++ exceptions for error handling). Verified locally on

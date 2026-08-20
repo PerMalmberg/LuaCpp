@@ -17,6 +17,7 @@ extern "C"
 #include <string_view>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -228,6 +229,7 @@ class Lua final
         open_selected_libs(libs);
         lua_pushcfunction(*this, &Lua::captured_print);
         lua_setglobal(*this, "print"); // default: print() output goes nowhere
+        setup_global_protection_proxy();
     }
 
     ~Lua() = default;
@@ -271,7 +273,8 @@ class Lua final
         for(const auto& name : registered_global_names)
         {
             lua_pushnil(*this);
-            lua_setglobal(*this, name.c_str());
+            write_real_global(name.c_str());
+            protected_globals.erase(name);
         }
 
         // A single LUA_GCCOLLECT queues newly-unreachable objects with a
@@ -470,7 +473,8 @@ class Lua final
         if(dot == std::string::npos)
         {
             lua_pushnil(*this);
-            lua_setglobal(*this, dotted_path.c_str());
+            write_real_global(dotted_path.c_str()); // bypass protection - this is a trusted C++ call
+            protected_globals.erase(dotted_path); // no longer meaningful once nil'd
             return;
         }
 
@@ -487,6 +491,28 @@ class Lua final
         lua_pushnil(*this);
         lua_setfield(*this, -2, field_name.c_str());
         lua_pop(*this, 1); // pop parent table
+    }
+
+    // Marks an existing Lua global as protected: subsequent script-side
+    // attempts to write to it raise a catchable Lua error ("attempt to
+    // modify protected global '<name>'") instead of silently overwriting it.
+    // Every global set via assign() or expose_func() is protected
+    // automatically the moment it is registered - use this to extend the
+    // same protection to a global instead set from Lua itself (e.g. via
+    // run_script), or to re-protect a name after unprotect_global(). Reads
+    // of a protected global are completely unaffected; only writes are
+    // rejected. Has no effect on globals set via expose_method/
+    // expose_mutable_method, which are not stored as globals at all.
+    void protect_global(const std::string& name)
+    {
+        protected_globals.insert(name);
+    }
+
+    // Removes protection from `name`, allowing script code to overwrite it
+    // again. No effect if `name` was not protected.
+    void unprotect_global(const std::string& name)
+    {
+        protected_globals.erase(name);
     }
 
     std::tuple<bool, std::string> run_script(const char* script)
@@ -539,7 +565,8 @@ class Lua final
     void assign(const char* name, const T& value)
     {
         push(state.get(), decay_for_push(value));
-        lua_setglobal(*this, name);
+        write_real_global(name); // bypass protection - this is a trusted C++ call
+        protected_globals.insert(name); // protect it from script-side overwrite by default
     }
 
     // Calls a named Lua global function and collects up to N typed return values.
@@ -1266,7 +1293,8 @@ class Lua final
 
         push_weak_upvalue(*this, fn);
         lua_pushcclosure(*this, &Lua::trampoline, 1);
-        lua_setglobal(*this, name);
+        write_real_global(name); // bypass protection - this is a trusted C++ call
+        protected_globals.insert(name); // protect it from script-side overwrite by default
     }
 
     // Builds the typed trampoline closure shared by both expose_method overloads.
@@ -1342,6 +1370,14 @@ class Lua final
     // metatables in the Lua registry, not as globals - see close().
     std::vector<std::string> registered_global_names;
 
+    // Names that script-side writes are currently rejected for - see
+    // protect_global/unprotect_global and setup_global_protection_proxy().
+    // Every assign()/expose_func() registration inserts its name here
+    // automatically; entries are removed again by unprotect_global(),
+    // close() (for expose_func names), and sandbox_deny() (for a bare name
+    // it nils out).
+    std::unordered_set<std::string> protected_globals;
+
     // Set by close(); guards against redundant nil-ing/GC work if close() is
     // called more than once. See close() for the full rationale.
     bool closed = false;
@@ -1353,6 +1389,103 @@ class Lua final
     // luaL_newstate's automatic one.
     LuaStatePtr state{lua_newstate(&Lua::limited_alloc, this, luaL_makeseed(nullptr)),
                       [](lua_State* L) { lua_close(L); }};
+
+    // ---------------------------------------------------------------------------
+    // Read-only C++ globals (script-side write protection for assign()/
+    // expose_func()-registered globals)
+    //
+    // Lua only consults a table's __newindex metamethod for keys that don't
+    // already raw-exist in it (lua_load in lapi.c reads the globals table
+    // from the registry - LUA_RIDX_GLOBALS - at chunk-load time to bind each
+    // chunk's _ENV upvalue). Because assign()/expose_func() write directly
+    // into the real globals table, a metamethod attached to THAT table would
+    // never fire for a second write to an already-existing key - exactly the
+    // case that needs to be caught. So instead, the real globals table is
+    // renamed internally ("real_G", kept reachable via a private registry
+    // key) and a brand-new, permanently-EMPTY proxy table is installed in
+    // its place as LUA_RIDX_GLOBALS. Because the proxy never gains raw
+    // entries of its own, its __index/__newindex metamethods fire for every
+    // single global read/write from Lua code, without exception - __index
+    // transparently forwards reads to real_G; __newindex
+    // (protected_newindex) rejects writes to any name in protected_globals
+    // and otherwise writes through to real_G. All C++-driven global writes
+    // (assign/register_global_func/close()/sandbox_deny) go through
+    // write_real_global() instead of lua_setglobal(), bypassing the proxy
+    // entirely - protection only ever blocks *script*-side writes, never
+    // LuaCpp's own.
+    // ---------------------------------------------------------------------------
+
+    // Stable registry key under which the real globals table is stashed once
+    // the proxy is installed - see setup_global_protection_proxy().
+    static const void* real_globals_key()
+    {
+        static const char sentinel = 0;
+        return &sentinel;
+    }
+
+    // Writes the value currently on top of the stack directly into the real
+    // (unproxied) globals table under `name`, consuming that value. Used for
+    // every C++-driven global write so protection never blocks LuaCpp's own
+    // writes, only script-side ones.
+    void write_real_global(const char* name)
+    {
+        lua_rawgetp(*this, LUA_REGISTRYINDEX, real_globals_key()); // stack: [value, real_G]
+        lua_insert(*this, -2); // stack: [real_G, value]
+        lua_setfield(*this, -2, name); // real_G[name] = value; pops value; real_G has no
+                                       // metatable of its own, so this is effectively raw
+        lua_pop(*this, 1); // pop real_G
+    }
+
+    // Snapshots the current (real) globals table under a private registry
+    // key, then installs a fresh, permanently-empty proxy table as the
+    // "globals table" that lua_getglobal/lua_setglobal and every future
+    // chunk's _ENV actually operate on - see the block comment above.
+    // Called once, at the end of construction, after every library and
+    // `print` have already been installed into the real table.
+    void setup_global_protection_proxy()
+    {
+        lua_rawgeti(*this, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS); // push current (real) globals table
+        lua_rawsetp(*this, LUA_REGISTRYINDEX, real_globals_key()); // registry[key] = real_G; pops it
+
+        lua_newtable(*this); // proxy
+        lua_newtable(*this); // metatable
+        lua_rawgetp(*this, LUA_REGISTRYINDEX, real_globals_key());
+        lua_setfield(*this, -2, "__index"); // metatable.__index = real_G
+        lua_pushcfunction(*this, &Lua::protected_newindex);
+        lua_setfield(*this, -2, "__newindex"); // metatable.__newindex = protected_newindex
+        lua_setmetatable(*this, -2); // set metatable on proxy; pops metatable
+        lua_rawseti(*this, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS); // proxy becomes THE globals table; pops it
+    }
+
+    // __newindex metamethod for the globals proxy installed by
+    // setup_global_protection_proxy(). Standard __newindex signature:
+    // argument 1 = table (the proxy), 2 = key, 3 = value. Raises a catchable
+    // Lua error (also reported via log_error) for any string key present in
+    // protected_globals; otherwise writes through to the real globals table.
+    static int protected_newindex(lua_State* L)
+    {
+        auto* self = *static_cast<Lua**>(lua_getextraspace(L));
+
+        if(self && lua_type(L, 2) == LUA_TSTRING)
+        {
+            std::size_t len = 0;
+            const char* key = lua_tolstring(L, 2, &len);
+            std::string name(key, len);
+            if(self->protected_globals.count(name) > 0)
+            {
+                auto msg = "attempt to modify protected global '" + name + "'";
+                self->log_error(msg);
+                return luaL_error(L, "%s", msg.c_str());
+            }
+        }
+
+        lua_rawgetp(L, LUA_REGISTRYINDEX, real_globals_key()); // stack: [table, key, value, real_G]
+        lua_pushvalue(L, 2); // key
+        lua_pushvalue(L, 3); // value
+        lua_rawset(L, -3); // real_G[key] = value
+        lua_pop(L, 1); // pop real_G
+        return 0;
+    }
 
     // ---------------------------------------------------------------------------
     // Stack I/O - static so they work both from instance methods and from inside
