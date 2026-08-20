@@ -14,7 +14,8 @@ and from Lua scripts with automatic type checking and clear error messages.
 
 - [Requirements](#requirements)
 - [Building](#building)
-- [Using LuaCpp in Your Own Project](#using-luacpp-in-your-own-project)
+  - [Using LuaCpp in Your Own Project](#using-luacpp-in-your-own-project)
+  - [Manual / Non-CMake Integration](#manual--non-cmake-integration)
 - [Quick Start](#quick-start)
 - [Supported Types](#supported-types)
 - [API](#api)
@@ -104,6 +105,96 @@ LuaCpp's own `LUACPP_BUILD_EXAMPLES`/`LUACPP_BUILD_TESTS` options default to
 executable is added to your build - and target names like `main`/`tests` in
 your own project won't collide with anything LuaCpp defines internally
 (its own targets are named `luacpp_example`/`luacpp_tests`).
+
+### Manual / Non-CMake Integration
+
+If you can't use the CMake target above (a different build system, an IDE
+project file, vendoring the sources directly, etc.), you are responsible for
+replicating everything `LuaCpp::LuaCpp` normally does for you. `src/Lua.hpp`
+itself is header-only, but it wraps Lua 5.5's C API, and **how Lua is built
+matters a great deal** - getting any of the following wrong tends to produce
+working-looking builds that crash or misbehave only in specific error paths
+(exceptions, `error()`, wrong-argument-type checks), which can be very hard
+to trace back to the build configuration. Checklist:
+
+1. **C++17 or later.** Required by `Lua.hpp` itself (`std::string_view`,
+   structured bindings, `if constexpr`, fold expressions, etc.).
+
+2. **Use Lua 5.5.0 sources**, and compile **every** `.c` file (except `lua.c`
+   and `luac.c`, which define their own `main()`/REPL and are not needed) as
+   **C++, not C**. Lua's own error-propagation mechanism (`ldo.c`) detects
+   `__cplusplus` at compile time and switches from `setjmp`/`longjmp` to
+   throwing/catching a C++ exception at the `lua_pcall` boundary - this is
+   Lua's own documented, supported way of embedding in C++, and is what lets
+   exceptions thrown by your `expose_func`/`expose_method`/
+   `expose_mutable_method` callables unwind cleanly through Lua's own frames
+   (running destructors correctly) instead of corrupting state. **Do not**
+   define `LUA_USE_LONGJMP` - that forces the C `setjmp`/`longjmp` path
+   instead, which this project intentionally does not use (see the comment
+   above the `lua_static` target in `CMakeLists.txt` for the full history).
+
+3. **Preserve C linkage for every Lua symbol.** Lua's headers
+   (`lua.h`/`lauxlib.h`/`lualib.h`) do **not** wrap their own declarations in
+   `extern "C"` - callers are expected to do that themselves (`Lua.hpp`
+   already does, for its own `#include`s). If you compile Lua's `.c` files
+   as C++ (per point 2) without also wrapping them in an `extern "C" { ... }`
+   block, their *definitions* get C++ name-mangled and every call from
+   `Lua.hpp` fails to link. The simplest approach (and what this project's
+   own `CMakeLists.txt` does) is a single generated wrapper translation unit:
+   ```cpp
+   // lua_cxx_unity.cpp
+   extern "C" {
+   #include "lapi.c"
+   #include "lauxlib.c"
+   // ... one #include per Lua .c source (except lua.c/luac.c) ...
+   }
+   ```
+   compiled as a single C++ TU. Compiling each `.c` file individually and
+   linking the objects together also works, as long as each one is wrapped
+   in `extern "C"` and compiled as C++.
+
+4. **On MSVC, compile with `/EHa`, not the default `/EHsc`**, for both the
+   Lua sources *and* every one of your own translation units that calls into
+   Lua or has live C++ objects (RAII, `try`/`catch`) on the stack during a
+   Lua call. `/EHsc` (synchronous-only C++ exceptions) is documented by
+   Microsoft as unsafe to combine with `setjmp`/`longjmp`-based unwinding,
+   and - independently of that - `/EHa` is the safest general choice when
+   mixing C code compiled as C++ with real C++ exceptions. Also add
+   `/bigobj` to any translation unit that ends up with a lot of exception
+   handlers (`/EHa` generates more unwind metadata than `/EHsc` and can push
+   large files, like a big test suite, over MSVC's object-file section
+   limit).
+
+5. **Platform defines and system libraries**, matching what `luaL_openlibs`
+   and the `os`/`io` libraries need at runtime:
+   - Linux: define `LUA_USE_LINUX`; link `m` and `dl`.
+   - macOS: define `LUA_USE_MACOSX`; link `m`.
+   - Windows/MSVC: no `LUA_USE_*` define is needed; define
+     `_CRT_SECURE_NO_WARNINGS` to silence MSVC's warnings about Lua's use of
+     unsafe CRT functions (e.g. `sprintf`).
+
+6. **Expect (and silence, don't "fix") a couple of compiler warnings** that
+   are inherent to compiling unmodified Lua C sources as C++ under
+   `-Wall -Wextra`:
+   - GCC: `-Wmaybe-uninitialized` produces false positives in a few places
+     (GCC's flow analysis for unions/structs differs between C and C++);
+     downgrade with `-Wno-error=maybe-uninitialized` rather than disabling
+     `-Werror` entirely.
+   - AppleClang: the equivalent warning is spelled `-Wno-error=uninitialized`
+     instead (Clang has no `-Wmaybe-uninitialized` flag).
+   - MSVC with `/EHa`: expect `C4297` ("function assumed not to throw...")
+     on a couple of `extern "C"` functions in `ldo.c` - Lua throws a C++
+     exception across an `extern "C"` boundary by design; this is a warning,
+     not an error, and doesn't affect correctness.
+
+7. **Add `src/` (this repository) to your include path** so `#include
+   "Lua.hpp"` resolves, and make sure Lua's own headers (`lua.h`,
+   `lauxlib.h`, `lualib.h`) are reachable on the include path too (they are
+   `#include`d, wrapped in `extern "C"`, at the top of `Lua.hpp`).
+
+If anything here changes in a future Lua release, `CMakeLists.txt`'s
+`lua_static` target is the authoritative, always-up-to-date reference for
+exactly how this project builds Lua - mirror it if in doubt.
 
 ## Quick Start
 

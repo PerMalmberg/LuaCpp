@@ -883,6 +883,49 @@ a new bullet, since it's the same overall feature/checkbox) and README's
 "Read-Only C++ Globals" section with a new paragraph + example + the
 debug-library caveat callout.
 
+## Documented manual/non-CMake integration requirements in README
+
+User asked for docs covering usage of LuaCpp when NOT pulled in via the
+LuaCpp::LuaCpp CMake target (e.g. a different build system, IDE project,
+vendored sources). Added a new "Manual / Non-CMake Integration" README
+section (TOC entry added under "Using LuaCpp in Your Own Project"),
+transcribing every non-obvious requirement currently encoded only in
+CMakeLists.txt's lua_static target into prose a non-CMake consumer can
+follow:
+1. C++17 requirement.
+2. Compile every Lua 5.5 .c file (except lua.c/luac.c) as C++, not C - and
+   explicitly do NOT define LUA_USE_LONGJMP (Lua's ldo.c auto-detects
+   __cplusplus and uses real C++ exceptions across lua_pcall, which is
+   what lets expose_func/expose_method exceptions unwind destructors
+   correctly).
+3. Preserve C linkage via a single extern "C" { #include "x.c" ... }
+   wrapper translation unit (Lua's own headers don't wrap themselves).
+4. MSVC: use /EHa (not default /EHsc) for both Lua sources and any
+   consumer TU that calls into Lua or has live C++ objects on the stack
+   during a Lua call, plus /bigobj for large TUs.
+5. Platform defines/libs: LUA_USE_LINUX (+m,dl) / LUA_USE_MACOSX (+m) /
+   MSVC needs _CRT_SECURE_NO_WARNINGS, no LUA_USE_* define.
+6. Expected-safe-to-silence warnings per compiler (GCC
+   -Wno-error=maybe-uninitialized, Clang -Wno-error=uninitialized, MSVC
+   C4297 on extern "C" functions under /EHa).
+7. Include-path requirements (src/ for Lua.hpp, Lua's own headers
+   reachable since Lua.hpp extern-C-wraps their #include).
+
+Closes by pointing at CMakeLists.txt's lua_static target as the
+authoritative reference if Lua's build requirements ever change in a
+future release. Docs-only change; verified full 243/243 test suite still
+passes, no code touched.
+
+Also note: partway through this session a stale/corrupted attachment
+diff was shown for Lua.hpp (extern "C" opening mangled into "ude
+<lauxlib.h>") - verified via read_file that the actual on-disk file was
+NOT corrupted (still starts with the correct extern "C" { block) and a
+rebuild succeeded with "no work to do" (no recompilation needed) -
+confirms it was a stale/bad tool-attachment artifact, not a real file
+change. Worth double-checking with read_file/rebuild if a similarly
+alarming attachment diff appears again rather than assuming the file is
+actually broken.
+
 ## Status as of last update
 Simplified to single-unity-TU + /EHa fix, WITHOUT LUA_USE_LONGJMP (Lua
 uses native C++ exceptions for error handling). Verified locally on
