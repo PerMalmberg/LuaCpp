@@ -853,50 +853,47 @@ class Lua final
     //     pointer/reference into one of its fields) anywhere that outlives the
     //     call leaves a dangling pointer; the write-back to Lua happens
     //     separately, by value, after the function returns.
+    //   - Lambda captures that hold references must outlive the Lua instance.
+    //     Value captures are always safe. Use the std::shared_ptr<Owner>
+    //     overload below (or keep_alive() for multiple owners) when a
+    //     reference capture to a shorter-lived object is needed - see
+    //     expose_func's owner overloads for the full rationale.
+    //
+    // Implemented in terms of the keep_alive() overload further below (with an
+    // empty owner list), the same way as expose_func/expose_method.
     template <typename StructType, typename... ReturnTypes, typename... Args>
     void expose_mutable_method(const char* name, std::function<lua_return_t<ReturnTypes...>(StructType&, Args...)> func)
+    {
+        expose_mutable_method<StructType, ReturnTypes...>(name, keep_alive(), std::move(func));
+    }
+
+    // Same as expose_mutable_method above, but keeps `owner` alive for as long
+    // as the registered Lua closure exists. Use this overload whenever `func`
+    // captures a reference to *owner, or to something owned by it - see
+    // expose_func(name, owner, func) for the full rationale. Implemented in
+    // terms of the keep_alive() overload below.
+    template <typename StructType, typename... ReturnTypes, typename... Args, typename Owner>
+    void expose_mutable_method(const char* name,
+                               std::shared_ptr<Owner> owner,
+                               std::function<lua_return_t<ReturnTypes...>(StructType&, Args...)> func)
+    {
+        expose_mutable_method<StructType, ReturnTypes...>(name, keep_alive(std::move(owner)), std::move(func));
+    }
+
+    // Same as expose_mutable_method(name, owner, func) above, but keeps
+    // MULTIPLE owners alive for as long as the registered method closure
+    // exists - see expose_func's own multi-owner overload and keep_alive()
+    // for the rationale and usage pattern; self/Args are handled the same way
+    // as the single-owner expose_mutable_method overload.
+    template <typename StructType, typename... ReturnTypes, typename... Args, typename... Owners>
+    void expose_mutable_method(const char* name,
+                               std::tuple<std::shared_ptr<Owners>...> owners,
+                               std::function<lua_return_t<ReturnTypes...>(StructType&, Args...)> func)
     {
         static_assert(has_lua_fields<StructType>::value,
                       "expose_mutable_method: StructType must be registered with LUA_REGISTER_STRUCT");
 
-        auto wrapper = std::make_unique<LuaFunc>(
-        [func = std::move(func)](lua_State* L) -> int
-        {
-            constexpr int n_method_args = static_cast<int>(sizeof...(Args));
-            constexpr int expected = n_method_args + 1; // +1 for implicit self
-            if(const int got = lua_gettop(L); got != expected)
-            {
-                throw std::runtime_error("expected " + std::to_string(n_method_args) + " argument(s), got " +
-                                         std::to_string(got - 1));
-            }
-
-            auto self = read<StructType>(L, 1);
-            auto extra_args = collect_args_from<Args...>(L, 2, std::index_sequence_for<Args...>{});
-
-            if constexpr(sizeof...(ReturnTypes) == 0)
-            {
-                std::apply([&](auto&&... a) { func(self, std::forward<decltype(a)>(a)...); }, std::move(extra_args));
-                write_struct_back(L, 1, self);
-                return 0;
-            }
-            else if constexpr(sizeof...(ReturnTypes) == 1)
-            {
-                auto result = std::apply([&](auto&&... a) { return func(self, std::forward<decltype(a)>(a)...); },
-                                         std::move(extra_args));
-                write_struct_back(L, 1, self);
-                push(L, result);
-                return 1;
-            }
-            else
-            {
-                auto results = std::apply([&](auto&&... a) { return func(self, std::forward<decltype(a)>(a)...); },
-                                          std::move(extra_args));
-                write_struct_back(L, 1, self);
-                push_results(L, results, std::index_sequence_for<ReturnTypes...>{});
-                return static_cast<int>(sizeof...(ReturnTypes));
-            }
-        });
-
+        auto wrapper = make_mutable_method_wrapper<StructType, ReturnTypes...>(std::move(func), std::move(owners));
         std::shared_ptr<LuaFunc> fn(std::move(wrapper));
         registered_funcs.push_back(fn);
 
@@ -1386,6 +1383,53 @@ class Lua final
             else
             {
                 auto results = std::apply(func, std::move(all_args));
+                push_results(L, results, std::index_sequence_for<ReturnTypes...>{});
+                return static_cast<int>(sizeof...(ReturnTypes));
+            }
+        });
+    }
+
+    // Builds the typed trampoline closure shared by all three expose_mutable_method
+    // overloads. See make_func_wrapper for the meaning of `keep_alive`.
+    template <typename StructType, typename... ReturnTypes, typename... Args, typename KeepAlive>
+    static std::unique_ptr<LuaFunc> make_mutable_method_wrapper(
+    std::function<lua_return_t<ReturnTypes...>(StructType&, Args...)> func,
+    KeepAlive keep_alive)
+    {
+        return std::make_unique<LuaFunc>(
+        [func = std::move(func), keep_alive = std::move(keep_alive)](lua_State* L) -> int
+        {
+            (void)keep_alive; // captured only to extend the owner(s)' lifetime
+            constexpr int n_method_args = static_cast<int>(sizeof...(Args));
+            constexpr int expected = n_method_args + 1; // +1 for implicit self
+            if(const int got = lua_gettop(L); got != expected)
+            {
+                throw std::runtime_error("expected " + std::to_string(n_method_args) + " argument(s), got " +
+                                         std::to_string(got - 1));
+            }
+
+            auto self = read<StructType>(L, 1);
+            auto extra_args = collect_args_from<Args...>(L, 2, std::index_sequence_for<Args...>{});
+
+            if constexpr(sizeof...(ReturnTypes) == 0)
+            {
+                std::apply([&](auto&&... a) { func(self, std::forward<decltype(a)>(a)...); }, std::move(extra_args));
+                write_struct_back(L, 1, self);
+                return 0;
+            }
+            else if constexpr(sizeof...(ReturnTypes) == 1)
+            {
+                auto result = std::apply([&](auto&&... a) { return func(self, std::forward<decltype(a)>(a)...); },
+                                         std::move(extra_args));
+                write_struct_back(L, 1, self);
+                push(L, result);
+                return 1;
+            }
+            else
+            {
+                auto results = std::apply([&](auto&&... a) { return func(self, std::forward<decltype(a)>(a)...); },
+                                          std::move(extra_args));
+                write_struct_back(L, 1, self);
                 push_results(L, results, std::index_sequence_for<ReturnTypes...>{});
                 return static_cast<int>(sizeof...(ReturnTypes));
             }

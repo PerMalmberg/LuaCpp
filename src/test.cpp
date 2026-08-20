@@ -853,6 +853,71 @@ TEST_CASE("expose_method: keep_alive() bundles multiple owners for a method clos
     REQUIRE((*log)[0] == 6); // 3 * scale(2)
 }
 
+TEST_CASE("expose_mutable_method: shared_ptr owner keeps referenced object alive", "[expose_mutable_method][lifetime]")
+{
+    Lua lua;
+    auto log = std::make_shared<std::vector<int>>();
+
+    lua.expose_mutable_method<Point>("bump_and_log", log,
+                                     std::function<void(Point&)>(
+                                     [raw = log.get()](Point& p)
+                                     {
+                                         ++p.x;
+                                         raw->push_back(p.x);
+                                     }));
+    lua.assign("p", Point{5, 6});
+    lua.run_script("p:bump_and_log(); p:bump_and_log()");
+
+    REQUIRE(log->size() == 2);
+    REQUIRE((*log)[0] == 6);
+    REQUIRE((*log)[1] == 7);
+}
+
+TEST_CASE("expose_mutable_method: keep_alive() bundles multiple owners for a mutating method closure",
+          "[expose_mutable_method][lifetime]")
+{
+    Lua lua;
+    auto log = std::make_shared<std::vector<int>>();
+    auto scale = std::make_shared<int>(2);
+
+    lua.expose_mutable_method<Point, int>("scale_and_log", Lua::keep_alive(log, scale),
+                                          std::function<int(Point&)>(
+                                          [l = log.get(), s = scale.get()](Point& p)
+                                          {
+                                              p.x *= (*s);
+                                              l->push_back(p.x);
+                                              return static_cast<int>(l->size());
+                                          }));
+
+    lua.assign("p", Point{3, 4});
+
+    auto [ok, err] = lua.run_script("assert(p:scale_and_log() == 1); assert(p.x == 6)");
+    REQUIRE(ok);
+    REQUIRE(log->size() == 1);
+    REQUIRE((*log)[0] == 6); // 3 * scale(2)
+}
+
+TEST_CASE("expose_mutable_method: shared_ptr owner survives after local shared_ptr is reset",
+          "[expose_mutable_method][lifetime]")
+{
+    Lua lua;
+    {
+        auto log = std::make_shared<std::vector<int>>();
+        lua.expose_mutable_method<Point>("bump_and_log", log,
+                                         std::function<void(Point&)>(
+                                         [raw = log.get()](Point& p)
+                                         {
+                                             ++p.x;
+                                             raw->push_back(p.x);
+                                         }));
+        // `log` goes out of scope here; the closure's own shared_ptr copy
+        // keeps the vector alive.
+    }
+    lua.assign("p", Point{1, 1});
+    auto [ok, err] = lua.run_script("p:bump_and_log(); assert(p.x == 2)");
+    REQUIRE(ok);
+}
+
 // ============================================================
 // Struct - error cases
 // ============================================================

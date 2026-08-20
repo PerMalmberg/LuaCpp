@@ -12,7 +12,7 @@ pointers into its elements stay stable even as new entries are added.
 
 Both `expose_func` and `expose_method` have an overload that takes a
 `std::shared_ptr<Owner> owner` argument between `name` and the
-`std::function`:
+`std::function`; `expose_mutable_method` has the identical overload set:
 
 ```cpp
 lua.expose_func("read_sensor", sensor /* shared_ptr<Sensor> */,
@@ -29,10 +29,11 @@ object is released. This does not protect callers who ignore this overload
 and capture a plain reference to a shorter-lived object; the pitfall
 comment on both functions points at this overload as the fix.
 
-Both functions also have a second overload for callables whose captures
-reference **more than one** shorter-lived object: it takes a
-`std::tuple<std::shared_ptr<Owners>...>` in the same position, most
-conveniently built with the `Lua::keep_alive()` helper:
+Both functions - and `expose_mutable_method`, identically - also have a
+second overload for callables whose captures reference **more than one**
+shorter-lived object: it takes a `std::tuple<std::shared_ptr<Owners>...>`
+in the same position, most conveniently built with the `Lua::keep_alive()`
+helper:
 
 ```cpp
 lua.expose_func("read_sensor", Lua::keep_alive(sensor, logger),

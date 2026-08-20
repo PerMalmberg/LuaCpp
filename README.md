@@ -475,8 +475,8 @@ lua.expose_func<int>("read_sensor", Lua::keep_alive(sensor, logger),
 ```
 
 The same overloads (single owner and `keep_alive()`) exist for
-`expose_method`. See [LIFETIME.md](LIFETIME.md) for the full rationale and
-the invariants this relies on.
+`expose_method` and `expose_mutable_method`. See [LIFETIME.md](LIFETIME.md)
+for the full rationale and the invariants this relies on.
 
 ---
 
@@ -553,6 +553,20 @@ lua.expose_mutable_method<Point, int>("scale_and_sum",
 
 Write-back covers only fields declared in `LUA_REGISTER_STRUCT`. Extra keys
 added to the Lua table by Lua code are left untouched.
+
+If the callable's captures reference a shorter-lived object, `expose_mutable_method`
+has the same `std::shared_ptr<Owner>` and `Lua::keep_alive()` overloads as
+`expose_func`/`expose_method` - see [expose_func](#expose_func) for the full
+rationale:
+
+```cpp
+auto log = std::make_shared<std::vector<int>>();
+lua.expose_mutable_method<Point>("bump_and_log", log,
+    std::function<void(Point&)>([raw = log.get()](Point& p) {
+        ++p.x;
+        raw->push_back(p.x);
+    }));
+```
 
 > **Note:** same registration-timing rule as `expose_method` - register before
 > pushing instances.
