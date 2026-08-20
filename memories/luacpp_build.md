@@ -615,6 +615,86 @@ instruction-limit/recursion-depth-cap). Full suite now 217/217 passing.
 Also manually verified `luacpp_example` still runs end-to-end (exit code
 0) after switching the underlying allocator/panic-handler wiring.
 
+## Implemented: Sandboxing (LuaLib enum + Lua(LuaLib) constructor + sandbox_deny)
+
+Added a `LuaLib` bitmask enum (namespace scope, above `class Lua`, alongside
+LuaCallTraceEvent/callbacks) with one flag per luaopen_* library (Base,
+Table, String, Math, Os, Io, Package, Debug, Coroutine, Utf8) plus `All`
+(bitwise-OR of all of them) and `None = 0`. `operator|`/`operator&`/
+`operator~` (masked to `All`) and a `has_lib(set, lib)` helper are free
+functions at namespace scope.
+
+`Lua()` now delegates to a new `explicit Lua(LuaLib libs)` constructor via
+`Lua() : Lua(LuaLib::All) {}` - fully backward compatible, since `LuaLib::All`
+opens every library exactly as `luaL_openlibs` did. `Lua(LuaLib libs)` calls
+a new private `open_selected_libs(libs)` instead of `luaL_openlibs`, which
+loops a small static table of `{flag, module_name, lua_CFunction}` entries
+and calls `luaL_requiref(*this, name, open_fn, /*glob=*/1)` + `lua_pop(1)`
+(requiref leaves the module table on the stack) only for set bits. Module
+name constants used: LUA_GNAME ("_G"), LUA_TABLIBNAME, LUA_STRLIBNAME,
+LUA_MATHLIBNAME, LUA_OSLIBNAME, LUA_IOLIBNAME, LUA_LOADLIBNAME (package),
+LUA_DBLIBNAME, LUA_COLIBNAME, LUA_UTF8LIBNAME.
+
+IMPORTANT: `print` is installed by the constructor UNCONDITIONALLY, after
+`open_selected_libs`, regardless of whether `LuaLib::Base` was requested - it
+is not part of any luaopen_* library in LuaCpp's own design (see
+captured_print/enable_output_capture). So even `Lua(LuaLib::None)` still has
+a working (if output-discarding) `print` global; only genuine stdlib
+functions like `assert`/`error`/`pcall` are absent when Base isn't opened.
+This tripped up an early test draft (assumed `print == nil` under
+`LuaLib::None`) - fixed by asserting `print ~= nil` instead, and by avoiding
+`assert()`/`error()` entirely in that test's script (since Base isn't open,
+those functions don't exist either) - used a plain `function check() return
+... end` (core language syntax, always available) inspected via `call<>()`
+instead of `assert()`-based scripts.
+
+Added `sandbox_deny(const std::string& dotted_path)`: splits on the first
+`.`; no dot -> `lua_pushnil` + `lua_setglobal`. One dot -> `lua_getglobal`
+the parent; if it's not a table (missing entirely, or not opened via
+`LuaLib`), silently returns (no-op, no exception) so it composes safely
+regardless of construction order; otherwise `lua_pushnil` + `lua_setfield`
+on the parent table. Deliberately supports only one level of nesting - no
+concrete need for deeper paths.
+
+Explicitly did NOT add an `apply_recommended_sandbox()` convenience/preset -
+user pushback: "let the user of the library decide" - LuaCpp provides only
+the primitives (`LuaLib` selection + `sandbox_deny`), no opinionated
+built-in denylist. `TODO.md`'s original example Lua snippet (nil-ing
+os.execute/io/dofile/load/require/package/debug) remains only as
+documentation of one sensible approach, not something the API bakes in.
+
+Added 8 new tests (`[sandboxing]` tag): default `Lua()` still opens every
+library (backward compat), `Lua(LuaLib)` opens only selected ones, `Lua
+(LuaLib::None)` opens nothing (with the print/assert caveats above),
+`sandbox_deny` on a bare global, `sandbox_deny` on a nested field (sibling
+untouched), no-op when the parent was never opened, no-op when the parent
+global exists but isn't a table (used `lua.assign("not_a_table", 42)` then
+denied a fake nested path under it), and a combined
+LuaLib-restriction-plus-sandbox_deny scenario. Full suite now 225/225
+passing (debug preset). Also manually re-ran `luacpp_example` end-to-end
+(exit code 0, unaffected since it uses the default `Lua()`).
+
+Updated `TODO.md` (checked off Sandboxing, one-paragraph implementation
+note) and `README.md` (new "Sandboxing" section + TOC entry, after
+"Exception Handling", with `LuaLib` bitmask + `sandbox_deny` examples -
+mirrors the existing section style; no built-in denylist offered there
+either, per the same user decision).
+
+Note: the hook-based auditing/protection features (call tracing, output
+capture, error logging, instruction counting/limit, recursion depth cap,
+memory tracking/limit) documented earlier in this file are NOT yet
+mentioned in README.md at all - only Sandboxing and Exception Handling
+have README sections. Could be a good follow-up if asked to expand docs
+further.
+
+Formatting note: user confirmed switching from tabs to spaces in Lua.hpp
+going forward (an earlier attachment showed the whole file auto-reformatted
+this way) - this session's new Lua.hpp edits were written directly with
+spaces to match. The bulk tabs->spaces reformat of the REST of the
+pre-existing file has NOT been committed/applied yet - only new code added
+this session uses spaces; still pending a decision on whether to do a
+dedicated whitespace-only commit for the rest of the file.
+
 ## Status as of last update
 Simplified to single-unity-TU + /EHa fix, WITHOUT LUA_USE_LONGJMP (Lua
 uses native C++ exceptions for error handling). Verified locally on

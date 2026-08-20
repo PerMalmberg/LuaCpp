@@ -3252,3 +3252,115 @@ TEST_CASE("memory limit: Lua instance remains usable after a memory-limit error"
     auto [ok2, err2] = lua.run_script("y = 2 + 2");
     REQUIRE(ok2);
 }
+
+TEST_CASE("sandboxing: default Lua() constructor still opens every library", "[sandboxing]")
+{
+    Lua lua;
+    auto [ok, err] = lua.run_script("assert(os ~= nil)\n"
+                                    "assert(io ~= nil)\n"
+                                    "assert(require ~= nil)\n"
+                                    "assert(package ~= nil)\n"
+                                    "assert(debug ~= nil)\n"
+                                    "assert(string ~= nil)\n"
+                                    "assert(table ~= nil)\n"
+                                    "assert(math ~= nil)\n"
+                                    "assert(coroutine ~= nil)\n"
+                                    "assert(utf8 ~= nil)\n");
+    REQUIRE(ok);
+}
+
+TEST_CASE("sandboxing: Lua(LuaLib) opens only the selected libraries", "[sandboxing]")
+{
+    Lua lua(LuaLib::Base | LuaLib::Table | LuaLib::String | LuaLib::Math);
+
+    auto [ok, err] = lua.run_script("assert(string ~= nil)\n"
+                                    "assert(table ~= nil)\n"
+                                    "assert(math ~= nil)\n"
+                                    "assert(os == nil)\n"
+                                    "assert(io == nil)\n"
+                                    "assert(require == nil)\n"
+                                    "assert(package == nil)\n"
+                                    "assert(debug == nil)\n"
+                                    "assert(coroutine == nil)\n"
+                                    "assert(utf8 == nil)\n");
+    REQUIRE(ok);
+}
+
+TEST_CASE("sandboxing: Lua(LuaLib::None) opens no libraries at all", "[sandboxing]")
+{
+    Lua lua(LuaLib::None);
+
+    // With LuaLib::None, base isn't opened either, so assert()/error() are
+    // themselves unavailable - define a plain function (core language
+    // syntax, not a library function) and inspect its results via call<>()
+    // instead.
+    auto [loaded, load_err] =
+    lua.run_script("function check() return (print ~= nil), (string == nil), (os == nil) end");
+    REQUIRE(loaded);
+
+    // print is always installed by the constructor regardless of LuaLib
+    // selection (see enable_output_capture) - it is not part of any
+    // luaopen_* library, so it remains present even here.
+    auto [ok, err, print_present, string_absent, os_absent] = lua.call<bool, bool, bool>("check");
+    REQUIRE(ok);
+    REQUIRE(print_present);
+    REQUIRE(string_absent);
+    REQUIRE(os_absent);
+}
+
+TEST_CASE("sandboxing: sandbox_deny removes a bare global", "[sandboxing]")
+{
+    Lua lua;
+    lua.sandbox_deny("dofile");
+
+    auto [ok, err] = lua.run_script("assert(dofile == nil)");
+    REQUIRE(ok);
+}
+
+TEST_CASE("sandboxing: sandbox_deny removes a nested field without disturbing siblings", "[sandboxing]")
+{
+    Lua lua;
+    lua.sandbox_deny("os.execute");
+
+    auto [ok, err] = lua.run_script("assert(os.execute == nil)\n"
+                                    "assert(os.time ~= nil)\n"); // sibling os.* entries untouched
+    REQUIRE(ok);
+}
+
+TEST_CASE("sandboxing: sandbox_deny is a no-op when the parent global doesn't exist", "[sandboxing]")
+{
+    Lua lua(LuaLib::Base | LuaLib::Table | LuaLib::String | LuaLib::Math); // os excluded entirely
+
+    REQUIRE_NOTHROW(lua.sandbox_deny("os.execute"));
+
+    auto [ok, err] = lua.run_script("assert(os == nil)");
+    REQUIRE(ok);
+}
+
+TEST_CASE("sandboxing: sandbox_deny is a no-op when the parent global is not a table", "[sandboxing]")
+{
+    Lua lua;
+    lua.assign("not_a_table", 42);
+
+    REQUIRE_NOTHROW(lua.sandbox_deny("not_a_table.field"));
+
+    auto [ok, err] = lua.run_script("assert(not_a_table == 42)"); // untouched
+    REQUIRE(ok);
+}
+
+TEST_CASE("sandboxing: combining restricted LuaLib construction with sandbox_deny", "[sandboxing]")
+{
+    Lua lua(LuaLib::Base | LuaLib::Table | LuaLib::String | LuaLib::Math | LuaLib::Os);
+    lua.sandbox_deny("os.execute");
+    lua.sandbox_deny("dofile");
+    lua.sandbox_deny("load");
+
+    auto [ok, err] =
+    lua.run_script("assert(pcall(function() return os.execute('true') end) == false or os.execute == nil)\n"
+                   "assert(os.execute == nil)\n"
+                   "assert(dofile == nil)\n"
+                   "assert(load == nil)\n"
+                   "assert(require == nil)\n" // package was never opened
+                   "assert(os.time ~= nil)\n"); // still usable
+    REQUIRE(ok);
+}

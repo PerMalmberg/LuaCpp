@@ -26,6 +26,7 @@ and from Lua scripts with automatic type checking and clear error messages.
   - [expose\_method](#expose_method)
   - [expose\_mutable\_method](#expose_mutable_method)
   - [Exception Handling](#exception-handling)
+  - [Sandboxing](#sandboxing)
 - [Gotchas](#gotchas)
 
 ## Requirements
@@ -464,6 +465,41 @@ Exceptions that do **not** derive from `std::exception` are not caught by
 LuaCpp and will propagate out of `run_script`/`call`/`expose_*` as a raw C++
 exception - catch it yourself at the call site if that's a possibility for
 your callables.
+
+---
+
+### Sandboxing
+
+By default, `Lua()` opens every standard Lua library, matching plain
+`luaL_openlibs`. To restrict which libraries a script can see, construct with
+an explicit `LuaLib` bitmask instead:
+
+```cpp
+Lua lua(LuaLib::Base | LuaLib::Table | LuaLib::String | LuaLib::Math);
+// os, io, package/require, debug, coroutine, and utf8 are never opened at all
+```
+
+For finer-grained control within a library that IS opened, use
+`sandbox_deny()` to remove a single global or one nested field:
+
+```cpp
+Lua lua(LuaLib::All & ~LuaLib::Io); // drop the whole io library
+lua.sandbox_deny("os.execute"); // keep os.time, os.date, etc. but remove os.execute
+lua.sandbox_deny("dofile");
+lua.sandbox_deny("load");
+```
+
+`sandbox_deny("name")` nils a bare global; `sandbox_deny("parent.field")` nils
+one nested field without touching sibling entries. It is a silent no-op if
+the named parent doesn't exist or isn't a table (e.g. denying an `os.*` path
+when `LuaLib::Os` was never opened), so combining both mechanisms is always
+safe regardless of which one runs first.
+
+LuaCpp does not ship a built-in denylist - decide for yourself which names
+to remove, based on what your embedding scripts should and shouldn't be able
+to do. `print()` output is unaffected either way; it is always discarded by
+default until `enable_output_capture` is called, no matter which libraries
+are opened.
 
 ---
 

@@ -41,21 +41,16 @@
   allocator as memory tracking above; limit breaches (and genuine system OOM) are also
   reported via `enable_error_logging`.
 
-- [ ] **Sandboxing** (high priority) — after `luaL_openlibs`, nil out globals scripts must
-  never reach:
-
-  ```lua
-  os.execute = nil
-  io         = nil
-  dofile     = nil
-  load       = nil
-  require    = nil
-  package    = nil
-  debug      = nil
-  ```
-
-  Alternatively, skip `luaL_openlibs` entirely and open only safe libs
-  (`luaopen_math`, `luaopen_string`, `luaopen_table`).
+- [x] **Sandboxing** (high priority) — implemented via a `LuaLib` bitmask enum and an
+  `explicit Lua(LuaLib libs)` constructor overload (`Lua()` still defaults to
+  `LuaLib::All`, opening every library exactly as before, so existing code is
+  unaffected). Only the selected libraries are opened via `luaL_requiref`, instead
+  of unconditionally calling `luaL_openlibs`. Finer-grained removal within an
+  otherwise-opened library (e.g. keeping `os.time` but removing `os.execute`) is
+  handled by `sandbox_deny("os.execute")`, which nils out a bare global or a single
+  dotted nesting level; it is a silent no-op if the named parent doesn't exist or
+  isn't opened, so it composes safely with constructor-level exclusion. LuaCpp does
+  not ship a built-in denylist — callers choose exactly which names to remove.
 
 - [ ] **Read-only C++ globals** (low priority) — attach a `__newindex` metamethod to `_G`
   so scripts cannot overwrite globals set from C++ via `assign`.

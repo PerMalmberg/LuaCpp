@@ -161,14 +161,71 @@ using LuaCallTraceCallback = std::function<void(const LuaCallTraceEvent&)>;
 using LuaOutputCallback = std::function<void(std::string_view)>;
 using LuaErrorLogCallback = std::function<void(std::string_view)>;
 
+// Bitmask selecting which standard Lua libraries a Lua instance opens - see
+// the Lua(LuaLib) constructor and sandbox_deny(). LuaLib::All (the default,
+// used by the no-arg Lua() constructor) matches the previous unconditional
+// luaL_openlibs() behavior exactly, so existing code is unaffected.
+enum class LuaLib : unsigned
+{
+    None = 0,
+    Base = 1u << 0, // _G: print, pcall, type, ipairs, error, ...
+    Table = 1u << 1,
+    String = 1u << 2,
+    Math = 1u << 3,
+    Os = 1u << 4,
+    Io = 1u << 5,
+    Package = 1u << 6, // also enables require()
+    Debug = 1u << 7,
+    Coroutine = 1u << 8,
+    Utf8 = 1u << 9,
+    All = Base | Table | String | Math | Os | Io | Package | Debug | Coroutine | Utf8,
+};
+
+constexpr LuaLib operator|(LuaLib lhs, LuaLib rhs)
+{
+    return static_cast<LuaLib>(static_cast<unsigned>(lhs) | static_cast<unsigned>(rhs));
+}
+
+constexpr LuaLib operator&(LuaLib lhs, LuaLib rhs)
+{
+    return static_cast<LuaLib>(static_cast<unsigned>(lhs) & static_cast<unsigned>(rhs));
+}
+
+constexpr LuaLib operator~(LuaLib lib)
+{
+    return static_cast<LuaLib>(~static_cast<unsigned>(lib) & static_cast<unsigned>(LuaLib::All));
+}
+
+constexpr bool has_lib(LuaLib set, LuaLib lib)
+{
+    return (set & lib) == lib;
+}
+
 class Lua final
 {
   public:
-    Lua()
+    // Opens every standard library
+    Lua() : Lua(LuaLib::All)
+    {
+    }
+
+    // Opens only the standard libraries selected by `libs`, instead of every
+    // one of them. Use this to reduce a script's attack surface - e.g.
+    // excluding LuaLib::Os/LuaLib::Io/LuaLib::Package/LuaLib::Debug removes
+    // os.execute, io.*, require/package, and the debug library entirely,
+    // rather than trying to individually nil out dangerous functions after
+    // the fact. Combine with sandbox_deny() for finer-grained denial within
+    // a library that is otherwise still opened (e.g. keeping `os.time` but
+    // removing `os.execute`).
+    //
+    // print() is unaffected by this constructor either way - see
+    // enable_output_capture: print() output is discarded by default
+    // regardless of which libraries are opened.
+    explicit Lua(LuaLib libs)
     {
         *static_cast<Lua**>(lua_getextraspace(static_cast<lua_State*>(*this))) = this;
         lua_atpanic(*this, &Lua::panic);
-        luaL_openlibs(*this);
+        open_selected_libs(libs);
         lua_pushcfunction(*this, &Lua::captured_print);
         lua_setglobal(*this, "print"); // default: print() output goes nowhere
     }
@@ -392,6 +449,44 @@ class Lua final
     std::size_t get_memory_usage() const
     {
         return memory.bytes_used;
+    }
+
+    // Removes a single global, or a single nested field one level deep, so it
+    // is no longer reachable from Lua code. `dotted_path` is either a bare
+    // global name (e.g. "dofile") or exactly one dot-separated nesting level
+    // (e.g. "os.execute"). Deeper paths are not supported.
+    //
+    // If the named global (or the parent of a nested path) does not exist, or
+    // is not a table, this is a silent no-op rather than an error - so it is
+    // safe to call sandbox_deny("os.execute") even when LuaLib::Os was never
+    // opened at all; the two approaches compose without needing to be kept in
+    // sync with each other.
+    //
+    // LuaCpp does not ship a built-in denylist - callers decide exactly which
+    // names to remove for their own use case.
+    void sandbox_deny(const std::string& dotted_path)
+    {
+        const auto dot = dotted_path.find('.');
+        if(dot == std::string::npos)
+        {
+            lua_pushnil(*this);
+            lua_setglobal(*this, dotted_path.c_str());
+            return;
+        }
+
+        const auto parent_name = dotted_path.substr(0, dot);
+        const auto field_name = dotted_path.substr(dot + 1);
+
+        lua_getglobal(*this, parent_name.c_str());
+        if(!lua_istable(*this, TOP_OF_STACK))
+        {
+            lua_pop(*this, 1);
+            return;
+        }
+
+        lua_pushnil(*this);
+        lua_setfield(*this, -2, field_name.c_str());
+        lua_pop(*this, 1); // pop parent table
     }
 
     std::tuple<bool, std::string> run_script(const char* script)
@@ -775,6 +870,41 @@ class Lua final
         std::size_t limit = 0; // 0 = unlimited (default)
     };
     MemoryState memory;
+
+    // Opens exactly the standard libraries selected by `libs`, using
+    // luaL_requiref (matching what luaL_openlibs does internally for each
+    // one) instead of the unconditional luaL_openlibs() call. Used by the
+    // Lua(LuaLib) constructor - see there for the rationale.
+    void open_selected_libs(LuaLib libs)
+    {
+        struct Entry
+        {
+            LuaLib flag;
+            const char* name;
+            lua_CFunction open_fn;
+        };
+        static constexpr Entry entries[] = {
+        {LuaLib::Base, LUA_GNAME, luaopen_base},
+        {LuaLib::Table, LUA_TABLIBNAME, luaopen_table},
+        {LuaLib::String, LUA_STRLIBNAME, luaopen_string},
+        {LuaLib::Math, LUA_MATHLIBNAME, luaopen_math},
+        {LuaLib::Os, LUA_OSLIBNAME, luaopen_os},
+        {LuaLib::Io, LUA_IOLIBNAME, luaopen_io},
+        {LuaLib::Package, LUA_LOADLIBNAME, luaopen_package},
+        {LuaLib::Debug, LUA_DBLIBNAME, luaopen_debug},
+        {LuaLib::Coroutine, LUA_COLIBNAME, luaopen_coroutine},
+        {LuaLib::Utf8, LUA_UTF8LIBNAME, luaopen_utf8},
+        };
+
+        for(const auto& entry : entries)
+        {
+            if(has_lib(libs, entry.flag))
+            {
+                luaL_requiref(*this, entry.name, entry.open_fn, 1);
+                lua_pop(*this, 1); // pop the library table luaL_requiref leaves on the stack
+            }
+        }
+    }
 
     // Recomputes the requested LUA_MASKCOUNT period as the minimum of whatever
     // instruction-counting and instruction-limit each currently want, since
