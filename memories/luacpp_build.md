@@ -63,3 +63,21 @@ owners) - see the memory-tool file for full details of each step.
   5) coroutine resumption after C++ teardown - same hazard as item 1,
      reachable via a resumed coroutine instead of a direct call.
 - Full test suite is currently 248/248 passing.
+
+## Named recurring magic numbers in Lua.hpp
+
+User asked to replace magic numbers with named constants. Added, near
+`TOP_OF_STACK`/HookState: `SELF_STACK_INDEX = 1` + `FIRST_ARG_AFTER_SELF = 2`
+(self/arg-start stack slots for expose_method/expose_mutable_method
+wrappers), `FIRST_ARG_NO_SELF = 1` (expose_func's arg-start slot),
+`WEAK_FUNC_UPVALUE_COUNT = 1` (the single upvalue every trampoline closure
+has - used for both `lua_pushcclosure(..., N)` call sites and
+`lua_upvalueindex(N)` in trampoline()), and
+`DEFAULT_INSTRUCTION_COUNT_PERIOD = 1000` (previously duplicated as a
+literal default arg in both `enable_instruction_counting` and
+`set_instruction_limit`). Deliberately did NOT touch the Lua-idiomatic
+stack-offset literals (-1/-2/-3 etc.) used throughout push/read/struct
+field code - those are universal, already commented per-use-site Lua C API
+conventions, not real "magic numbers". Verified: full rebuild, 248/248
+tests passing, luacpp_example runs end-to-end (exit 0). Committed as
+297c178.

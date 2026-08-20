@@ -373,7 +373,7 @@ class Lua final
     // If instruction-limit protection (set_instruction_limit) is also active,
     // the smaller of the two requested periods is used for both, since Lua
     // only supports a single count-period per lua_State.
-    void enable_instruction_counting(int period = 1000)
+    void enable_instruction_counting(int period = DEFAULT_INSTRUCTION_COUNT_PERIOD)
     {
         hooks.counting_enabled = true;
         hooks.instruction_count = 0;
@@ -398,7 +398,7 @@ class Lua final
     // Lua error (visible via run_script's/call<>'s {false, msg} return),
     // aborting the offending script. See enable_instruction_counting for the
     // note on shared count periods when both features are active together.
-    void set_instruction_limit(std::uint64_t limit, int period = 1000)
+    void set_instruction_limit(std::uint64_t limit, int period = DEFAULT_INSTRUCTION_COUNT_PERIOD)
     {
         hooks.instruction_limit = limit;
         update_count_period(period);
@@ -905,6 +905,11 @@ class Lua final
     using LuaStatePtr = std::unique_ptr<lua_State, LuaCloser>;
     using LuaFunc = std::function<int(lua_State*)>;
 
+    // Default LUA_MASKCOUNT period (in Lua VM instructions) used by both
+    // enable_instruction_counting() and set_instruction_limit() when the
+    // caller doesn't specify one - see either for what the period means.
+    static constexpr int DEFAULT_INSTRUCTION_COUNT_PERIOD = 1000;
+
     // ---------------------------------------------------------------------------
     // Hook-based auditing/protection state (call tracing, instruction counting,
     // instruction limit, recursion depth cap) - see the public enable_*/set_*
@@ -1309,7 +1314,7 @@ class Lua final
                                          std::to_string(got));
             }
 
-            auto args = collect_args_from<Args...>(L, 1, std::index_sequence_for<Args...>{});
+            auto args = collect_args_from<Args...>(L, FIRST_ARG_NO_SELF, std::index_sequence_for<Args...>{});
 
             if constexpr(sizeof...(ReturnTypes) == 0)
             {
@@ -1342,7 +1347,7 @@ class Lua final
         registered_global_names.emplace_back(name);
 
         push_weak_upvalue(*this, fn);
-        lua_pushcclosure(*this, &Lua::trampoline, 1);
+        lua_pushcclosure(*this, &Lua::trampoline, WEAK_FUNC_UPVALUE_COUNT);
         write_real_global(name); // bypass protection - this is a trusted C++ call
         protected_globals.insert(name); // protect it from script-side overwrite by default
     }
@@ -1366,8 +1371,8 @@ class Lua final
                                          std::to_string(got - 1));
             }
 
-            auto self = read<StructType>(L, 1);
-            auto args = collect_args_from<Args...>(L, 2, std::index_sequence_for<Args...>{});
+            auto self = read<StructType>(L, SELF_STACK_INDEX);
+            auto args = collect_args_from<Args...>(L, FIRST_ARG_AFTER_SELF, std::index_sequence_for<Args...>{});
             auto all_args = std::tuple_cat(std::make_tuple(std::move(self)), std::move(args));
 
             if constexpr(sizeof...(ReturnTypes) == 0)
@@ -1408,20 +1413,20 @@ class Lua final
                                          std::to_string(got - 1));
             }
 
-            auto self = read<StructType>(L, 1);
-            auto extra_args = collect_args_from<Args...>(L, 2, std::index_sequence_for<Args...>{});
+            auto self = read<StructType>(L, SELF_STACK_INDEX);
+            auto extra_args = collect_args_from<Args...>(L, FIRST_ARG_AFTER_SELF, std::index_sequence_for<Args...>{});
 
             if constexpr(sizeof...(ReturnTypes) == 0)
             {
                 std::apply([&](auto&&... a) { func(self, std::forward<decltype(a)>(a)...); }, std::move(extra_args));
-                write_struct_back(L, 1, self);
+                write_struct_back(L, SELF_STACK_INDEX, self);
                 return 0;
             }
             else if constexpr(sizeof...(ReturnTypes) == 1)
             {
                 auto result = std::apply([&](auto&&... a) { return func(self, std::forward<decltype(a)>(a)...); },
                                          std::move(extra_args));
-                write_struct_back(L, 1, self);
+                write_struct_back(L, SELF_STACK_INDEX, self);
                 push(L, result);
                 return 1;
             }
@@ -1429,7 +1434,7 @@ class Lua final
             {
                 auto results = std::apply([&](auto&&... a) { return func(self, std::forward<decltype(a)>(a)...); },
                                           std::move(extra_args));
-                write_struct_back(L, 1, self);
+                write_struct_back(L, SELF_STACK_INDEX, self);
                 push_results(L, results, std::index_sequence_for<ReturnTypes...>{});
                 return static_cast<int>(sizeof...(ReturnTypes));
             }
@@ -1440,6 +1445,24 @@ class Lua final
     // from the top of the stack. -1 = top, -2 = second from top, etc.
     //  1 = bottom, 2 = second from bottom, etc.
     static constexpr int TOP_OF_STACK = -1;
+
+    // expose_method/expose_mutable_method always receive self as the first
+    // argument, per Lua's colon-call convention (obj:method(...) is sugar for
+    // Type.method(obj, ...)) - so self is always stack slot 1, and any extra
+    // arguments always start at slot 2. Used by make_method_wrapper/
+    // make_mutable_method_wrapper instead of repeating the literals 1 and 2.
+    static constexpr int SELF_STACK_INDEX = 1;
+    static constexpr int FIRST_ARG_AFTER_SELF = SELF_STACK_INDEX + 1;
+
+    // expose_func has no implicit self, so its arguments start at slot 1 -
+    // used by make_func_wrapper instead of a bare literal.
+    static constexpr int FIRST_ARG_NO_SELF = 1;
+
+    // Every trampoline closure (expose_func/expose_method/expose_mutable_method)
+    // is created with exactly one upvalue - the std::weak_ptr<LuaFunc> pushed by
+    // push_weak_upvalue - so both lua_pushcclosure's upvalue count and
+    // trampoline()'s lua_upvalueindex() argument always refer to slot 1.
+    static constexpr int WEAK_FUNC_UPVALUE_COUNT = 1;
 
     const std::string get_error_message()
     {
@@ -1871,7 +1894,7 @@ class Lua final
     static int trampoline(lua_State* L)
     {
         auto* self = *static_cast<Lua**>(lua_getextraspace(L));
-        auto* weak = static_cast<std::weak_ptr<LuaFunc>*>(lua_touserdata(L, lua_upvalueindex(1)));
+        auto* weak = static_cast<std::weak_ptr<LuaFunc>*>(lua_touserdata(L, lua_upvalueindex(WEAK_FUNC_UPVALUE_COUNT)));
         auto fn = weak->lock();
         if(!fn)
         {
@@ -1999,7 +2022,7 @@ class Lua final
         }
 
         push_weak_upvalue(L, fn);
-        lua_pushcclosure(L, &Lua::trampoline, 1); // stack: [metatable, __index_table, closure]
+        lua_pushcclosure(L, &Lua::trampoline, WEAK_FUNC_UPVALUE_COUNT); // stack: [metatable, __index_table, closure]
         lua_setfield(L, -2, name); // __index_table[name] = closure
 
         lua_pop(L, 2); // pop __index_table and metatable
