@@ -738,6 +738,151 @@ Remaining unimplemented TODO.md item: "Read-only C++ globals" (attach a
 __newindex metamethod to _G so scripts can't overwrite C++-set globals) -
 low priority, not yet started.
 
+## Implemented: Read-only C++ globals (script-side write protection)
+
+Completed the final "Script Auditing & Protection" TODO.md item. Key
+technical insight that shaped the whole design: Lua only consults a
+table's __newindex metamethod for keys that DON'T already raw-exist in it.
+Since assign()/expose_func() write their name directly into the real
+globals table via lua_setglobal, attaching a metatable to that table
+directly would never fire __newindex on a SECOND write to an
+already-registered name - exactly the case that needs catching. So instead
+of metatabling the real table, the real globals table itself is swapped
+out:
+
+1. Snapshot the current LUA_RIDX_GLOBALS table into a private registry
+   key (real_globals_key(), a function-local static sentinel address,
+   same pattern as get_type_key<T>()) via lua_rawgetp/lua_rawsetp.
+2. Install a brand-new, PERMANENTLY EMPTY table as the new
+   LUA_RIDX_GLOBALS, with a metatable: __index = real_G (transparent read
+   forwarding), __newindex = protected_newindex (a static lua_CFunction).
+3. Because the proxy never gains any raw entries (nothing is ever
+   lua_rawset onto it directly), its __index/__newindex ALWAYS fire for
+   every single global read/write from Lua code, forever - not just the
+   first one for a given name. This is what makes it possible to protect
+   a name that already has a value.
+
+Confirmed via reading Lua 5.5's lapi.c: lua_load pulls the globals table
+from the registry (LUA_RIDX_GLOBALS) at CHUNK-LOAD time to bind each
+chunk's _ENV upvalue - so this only needs to be installed ONCE, in the
+constructor (after open_selected_libs + print, so the snapshotted real_G
+already contains everything); every future luaL_loadstring call (used by
+run_script) automatically picks up the (unchanging) proxy as _ENV.
+
+protected_newindex(L): standard __newindex signature (1=table, 2=key,
+3=value). If key is a string and present in self->protected_globals,
+raises luaL_error (message: "attempt to modify protected global '<name>'"),
+routed through log_error first. Otherwise writes through: rawget real_G,
+rawset key/value onto it.
+
+New private write_real_global(name) helper: consumes the value on top of
+the stack and writes it directly into real_G (via lua_setfield - real_G
+itself has no metatable of its own, so this acts as a raw set), bypassing
+the proxy/protected_newindex entirely. EVERY C++-driven global write now
+goes through this instead of lua_setglobal:
+- assign() - also inserts `name` into protected_globals right after
+  (auto-protection).
+- register_global_func() (backing expose_func) - same auto-protection.
+- close() - nils via write_real_global AND erases from protected_globals
+  (a closed/removed global has nothing meaningful left to protect).
+- sandbox_deny()'s bare-global branch - nils via write_real_global AND
+  erases from protected_globals. The nested-field branch is untouched
+  (lua_getglobal read of the parent still goes through the proxy's
+  __index transparently; the parent table itself, e.g. "os", has no
+  metatable, so lua_setfield on IT was never affected by any of this).
+
+New public API: `protect_global(name)` / `unprotect_global(name)` - simple
+insert/erase into protected_globals, exposed so a caller can (a) protect a
+global that was instead set FROM Lua (e.g. run_script("secret=1") then
+lua.protect_global("secret")), or (b) opt a specific assign()/expose_func
+name back OUT of the automatic protection.
+
+**Real bug caught in testing**: a test asserted exactly 1 log entry for a
+protected-global write attempt via run_script, but got 2 - same
+"intentional double-log" pattern already documented for expose_func
+exceptions (see earlier memory entry): protected_newindex logs the raw
+message once, and run_script's own Tier-2 error-logging site (added
+earlier in this session) logs the resulting Lua error string again after
+lua_pcall fails, since it also contains the same text. Fixed the test to
+assert `== 2` with an explanatory comment, matching the established
+pattern rather than treating it as a bug.
+
+Added 10 tests (`[read-only-globals]` tag): assign()-registered global
+blocked from script overwrite (with state remaining usable afterward),
+expose_func-registered global blocked (function stays fully callable),
+reading a protected global is unaffected, unrelated/un-registered globals
+remain freely writable, unprotect_global lifts protection,
+protect_global protects a Lua-set global, protection reported via error
+logging (2 entries, see bug note above), close() un-protects+nils an
+expose_func global, sandbox_deny on a bare name un-protects+nils it, and a
+sanity check that ordinary stdlib usage (math/string/table operations,
+i.e. reads through the proxy) is completely unaffected. Full suite now
+239/239 passing (up from 229). Verified `luacpp_example` still runs
+end-to-end (exit 0) - uses only assign/expose_func without any
+conflicting overwrite attempts, so unaffected by the new default
+protection.
+
+Updated TODO.md (checked off - **all** Script Auditing & Protection items
+are now complete) and README.md (new "Read-Only C++ Globals" section +
+TOC entry, after Memory Tracking & Limit, same style as the other hook
+sections).
+
+## Extended: protected expose_method/expose_mutable_method methods too
+
+Follow-up to the read-only-globals work: user asked whether methods added
+via expose_method/expose_mutable_method could also be protected from
+script tampering. These are NOT stored as globals at all - they live in a
+per-type metatable (one shared metatable per T, created lazily by
+add_method_to_registry, cached in the Lua registry keyed by get_type_key
+<T>()), whose __index sub-table holds the actual method closures. Attack
+surface: a script could do `local mt = getmetatable(instance);
+mt.__index.name = fn` to overwrite a method for ALL instances of that
+type, or `setmetatable(instance, {})` to strip method dispatch from one
+specific instance.
+
+Fix: when add_method_to_registry creates a type's metatable for the first
+time, also set `metatable.__metatable = typeid(T).name()` (any non-nil
+sentinel value works; used typeid's name purely for diagnostic value if
+ever inspected in a debugger - it is never exposed to Lua). Two built-in
+Lua behaviors around the __metatable field do all the actual protection
+work automatically, with zero extra machinery needed:
+- `getmetatable(x)` returns the __metatable field's VALUE instead of the
+  real metatable when one is set - so scripts get back the opaque
+  sentinel, never a table, and can never reach __index to tamper with it.
+- `setmetatable(x, ...)` raises "cannot change a protected metatable"
+  (this check is built into Lua's own lbaselib.c luaB_setmetatable) when
+  the CURRENT metatable already has __metatable set - so a script can't
+  replace or nil out an instance's metatable either.
+
+Added `#include <typeinfo>` for typeid(). No changes needed anywhere else
+- attach_methods_if_any/trampoline/push<T> etc. all look up the metatable
+directly via the registry key (bypassing getmetatable entirely), so they
+are completely unaffected by __metatable being set.
+
+IMPORTANT CAVEAT (documented in both TODO.md and README.md): the `debug`
+library intentionally bypasses __metatable via `debug.getmetatable`/
+`debug.setmetatable` - this is a known, deliberate Lua design choice (the
+whole point of the debug library is unrestricted introspection). If this
+protection must hold against genuinely untrusted scripts, the caller
+should exclude LuaLib::Debug via the constructor (see the Sandboxing
+feature) - LuaCpp doesn't/can't work around this at the __metatable level
+itself.
+
+Added 4 tests (`[read-only-methods]` tag): getmetatable returns a
+non-table sentinel (methods still callable normally), setmetatable is
+rejected with "protected metatable" in the message (instance remains
+fully usable afterward), confirms there's no reachable __index table to
+tamper with at all, and the same protection applies to
+expose_mutable_method types too (mutation via the method itself still
+works fine - only the metatable is locked, not method dispatch). Full
+suite now 243/243 passing (up from 239). Verified `luacpp_example` still
+runs end-to-end (exit 0).
+
+Updated TODO.md's existing "Read-only C++ globals" bullet (extended, not
+a new bullet, since it's the same overall feature/checkbox) and README's
+"Read-Only C++ Globals" section with a new paragraph + example + the
+debug-library caveat callout.
+
 ## Status as of last update
 Simplified to single-unity-TU + /EHa fix, WITHOUT LUA_USE_LONGJMP (Lua
 uses native C++ exceptions for error handling). Verified locally on

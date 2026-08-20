@@ -16,6 +16,7 @@ extern "C"
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <typeinfo>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1847,6 +1848,20 @@ class Lua final
             lua_newtable(L); // metatable
             lua_newtable(L); // __index table
             lua_setfield(L, -2, "__index"); // metatable.__index = {}
+
+            // Setting __metatable makes this metatable opaque to Lua code:
+            // getmetatable(instance) returns this sentinel value instead of the
+            // real metatable, and setmetatable(instance, ...) raises "cannot
+            // change a protected metatable" (built into Lua's own
+            // luaB_setmetatable) - so a script can neither read nor replace an
+            // instance's metatable, and therefore can never reach the shared
+            // __index table to overwrite/add methods for the type. Note: the
+            // debug library intentionally bypasses __metatable
+            // (debug.getmetatable/debug.setmetatable) - exclude LuaLib::Debug
+            // (see Sandboxing) if this protection must hold against untrusted
+            // scripts.
+            lua_pushstring(L, typeid(T).name());
+            lua_setfield(L, -2, "__metatable");
 
             lua_pushlightuserdata(L, const_cast<void*>(get_type_key<T>()));
             lua_pushvalue(L, -2); // duplicate metatable

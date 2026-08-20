@@ -62,7 +62,15 @@
   `enable_error_logging`) instead of silently succeeding. `protect_global`/
   `unprotect_global` let a caller extend or lift protection for any specific name.
   Reads of protected globals, and writes to any other (unprotected) name, are
-  completely unaffected.
+  completely unaffected. Methods registered via `expose_method`/`expose_mutable_method`
+  are protected too: every per-type method metatable now sets `__metatable` to an
+  opaque sentinel, so `getmetatable(instance)` never exposes the real metatable/
+  `__index` table and `setmetatable(instance, ...)` is rejected outright by Lua itself
+  ("cannot change a protected metatable") - a script can neither read nor replace an
+  instance's metatable, so it can never reach the shared `__index` table to add or
+  overwrite methods for the type. Note: the `debug` library intentionally bypasses
+  `__metatable` (`debug.getmetatable`/`debug.setmetatable`) - exclude `LuaLib::Debug`
+  (see Sandboxing) if this protection must hold against untrusted scripts.
 
 - [x] **Bytecode rejection** (high priority) — `run_script` now rejects any input
   beginning with the Lua bytecode signature byte `\x1b` before it ever reaches

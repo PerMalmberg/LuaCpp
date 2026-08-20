@@ -715,6 +715,28 @@ lua.unprotect_global("count"); // opt this one back out - scripts may overwrite 
 Protection violations are also reported via [Error Logging](#error-logging)
 if enabled.
 
+Methods registered via [`expose_method`](#expose_method)/
+[`expose_mutable_method`](#expose_mutable_method) are protected the same way,
+automatically, with no extra call needed:
+
+```cpp
+lua.expose_method<Point, int>("magnitude_sq",
+    std::function<int(Point)>([](Point p) { return p.x*p.x + p.y*p.y; }));
+lua.assign("p", Point{3, 4});
+
+auto [ok, err] = lua.run_script("setmetatable(p, {})");
+// ok == false, err contains "cannot change a protected metatable"
+
+auto [ok2, err2] = lua.run_script("getmetatable(p)");
+// getmetatable(p) never returns the real metatable/__index table at all,
+// so a script can't reach it to add or overwrite a method either
+```
+
+> **Note:** the `debug` library intentionally bypasses this protection
+> (`debug.getmetatable`/`debug.setmetatable`) - exclude `LuaLib::Debug` (see
+> [Sandboxing](#sandboxing)) if method protection must hold against
+> untrusted scripts.
+
 ---
 
 ## Gotchas

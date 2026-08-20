@@ -3529,3 +3529,68 @@ TEST_CASE("read-only globals: normal stdlib usage is unaffected by the proxy", "
                                     "local t = {} for i=1,5 do t[i]=i end assert(#t == 5)\n");
     REQUIRE(ok);
 }
+
+TEST_CASE("read-only methods: getmetatable does not expose the real metatable", "[read-only-methods]")
+{
+    Lua lua;
+    lua.expose_method<Point, int>("magnitude_sq",
+                                  std::function<int(Point)>([](Point p) { return p.x * p.x + p.y * p.y; }));
+    lua.assign("p", Point{3, 4});
+
+    auto [ok, err] = lua.run_script("local mt = getmetatable(p)\n"
+                                    "assert(type(mt) ~= 'table')\n" // opaque sentinel, not the real table
+                                    "assert(p:magnitude_sq() == 25)\n"); // methods still work normally
+    REQUIRE(ok);
+}
+
+TEST_CASE("read-only methods: setmetatable on an instance is rejected", "[read-only-methods]")
+{
+    Lua lua;
+    lua.expose_method<Point, int>("magnitude_sq",
+                                  std::function<int(Point)>([](Point p) { return p.x * p.x + p.y * p.y; }));
+    lua.assign("p", Point{3, 4});
+
+    auto [ok, err] = lua.run_script("setmetatable(p, {})");
+    REQUIRE_FALSE(ok);
+    REQUIRE(err.find("protected metatable") != std::string::npos);
+
+    // p is unaffected - still usable normally afterward.
+    auto [ok2, err2] = lua.run_script("assert(p:magnitude_sq() == 25)");
+    REQUIRE(ok2);
+}
+
+TEST_CASE("read-only methods: a script cannot overwrite a method via getmetatable", "[read-only-methods]")
+{
+    Lua lua;
+    lua.expose_method<Point, int>("magnitude_sq",
+                                  std::function<int(Point)>([](Point p) { return p.x * p.x + p.y * p.y; }));
+    lua.assign("p", Point{3, 4});
+
+    // getmetatable(p) doesn't return a table at all, so there's no __index
+    // table reachable to tamper with in the first place.
+    auto [ok, err] = lua.run_script("local mt = getmetatable(p)\n"
+                                    "assert(type(mt) ~= 'table')\n");
+    REQUIRE(ok);
+
+    auto [ok3, err3] = lua.run_script("assert(p:magnitude_sq() == 25)");
+    REQUIRE(ok3);
+}
+
+TEST_CASE("read-only methods: protection also applies to expose_mutable_method types", "[read-only-methods]")
+{
+    Lua lua;
+    lua.expose_mutable_method<Point>("translate", std::function<void(Point&, int, int)>(
+                                                  [](Point& p, int dx, int dy)
+                                                  {
+                                                      p.x += dx;
+                                                      p.y += dy;
+                                                  }));
+    lua.assign("p", Point{3, 4});
+
+    auto [ok, err] = lua.run_script("setmetatable(p, {})");
+    REQUIRE_FALSE(ok);
+    REQUIRE(err.find("protected metatable") != std::string::npos);
+
+    auto [ok2, err2] = lua.run_script("p:translate(1, 1)\nassert(p.x == 4 and p.y == 5)");
+    REQUIRE(ok2);
+}
