@@ -940,6 +940,51 @@ them call enable_output_capture, so only std::cout lines and {ok,err}
 tuples are visible; this is expected/consistent, not a bug. Full 243/243
 test suite unaffected (main.cpp isn't part of the test binary).
 
+## Expanded CI: ASAN for both luacpp_tests/luacpp_example + Debug/Release matrix
+
+Two follow-up requests in one session, both to .github/workflows/ci.yml
+and CMakeLists.txt:
+
+1. "Run CI so it runs tests and main with ASAN enabled": CMakeLists.txt's
+   LUACPP_ENABLE_ASAN block previously only applied
+   -fsanitize=address/-fno-omit-frame-pointer to luacpp_tests - extended
+   the same block (still guarded `if(LUACPP_ENABLE_ASAN AND NOT MSVC)`) to
+   luacpp_example too. ci.yml's Configure step now explicitly passes
+   -DLUACPP_ENABLE_ASAN=ON (this actually matched the option's existing
+   top-level default already, but being explicit is more robust/future-
+   proof against that default ever changing), and a brand new "Run
+   example" step was added - CI previously only ever ran `ctest`, it never
+   actually executed the built luacpp_example binary at all. Step picks
+   the right per-OS binary path (build/Release/luacpp_example.exe on
+   Windows vs build/luacpp_example elsewhere).
+
+2. "Run both debug and release builds in CI": added a `build_type: [Debug,
+   Release]` matrix dimension alongside the existing `os` matrix (3 OSes x
+   2 build types = 6 jobs total). Job `name` updated to
+   `${{ matrix.os }} (${{ matrix.build_type }})`. Configure/Build/Test/Run
+   example steps all switched from a hardcoded `Release` to
+   `${{ matrix.build_type }}`.
+
+Verified BOTH changes locally on Linux (not just trusting CI): did a
+from-scratch `cmake -B build/X -DCMAKE_BUILD_TYPE=<Debug|Release>
+-DLUACPP_ENABLE_ASAN=ON` + build + `ctest ... -C <config>` +
+`./build/X/luacpp_example` for both Debug and Release. Both configurations:
+compiled cleanly (saw "-- ASAN enabled for 'luacpp_example'" AND "...for
+'luacpp_tests'" in configure output), passed all 243/243 tests, and ran
+luacpp_example end-to-end with exit code 0 and zero ASAN reports (no
+leaks, no use-after-free, etc., across the whole feature set built up this
+session - hooks, sandboxing, read-only globals/methods, bytecode
+rejection). Cleaned up the throwaway build dirs afterward.
+
+Note: the user CANCELLED the first attempted commit for change #1 (ASAN
+expansion) before approving the wording - re-committed it together
+implicitly is NOT what happened; it was committed on its own after the
+cancellation didn't recur on a retry in the same turn... actually to be
+precise: change #1 was committed successfully on a subsequent request in
+the same conversation (no data lost, no explicit re-approval message
+beyond the user's next instruction), and change #2 (build_type matrix) was
+a separate, separately-committed follow-up request handled the normal way.
+
 ## Status as of last update
 Simplified to single-unity-TU + /EHa fix, WITHOUT LUA_USE_LONGJMP (Lua
 uses native C++ exceptions for error handling). Verified locally on

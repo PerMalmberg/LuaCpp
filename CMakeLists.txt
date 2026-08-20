@@ -208,6 +208,12 @@ if(LUACPP_BUILD_EXAMPLES)
   else()
     target_compile_options(luacpp_example PRIVATE -O2 -Wall -Wextra -Werror)
   endif()
+
+  if(LUACPP_ENABLE_ASAN AND NOT MSVC)
+    target_compile_options(luacpp_example PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+    target_link_options(luacpp_example PRIVATE -fsanitize=address)
+    message(STATUS "ASAN enabled for 'luacpp_example'")
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------
