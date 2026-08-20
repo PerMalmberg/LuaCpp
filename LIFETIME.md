@@ -167,14 +167,54 @@ function is UB.
 
 **Current state:** The `coroutine` library is loaded by default (`Lua()`
 opens every standard library) and is accessible to all scripts unless
-restricted.
+restricted. LuaCpp has no dedicated coroutine API - a `coroutine.create`
+result is an ordinary Lua value, so it survives across separate
+`run_script()`/`call<>()` calls for as long as the underlying `lua_State`
+exists (all calls on one `Lua` instance share the same state). A coroutine
+can therefore be created and suspended in one `run_script()` call and
+resumed by a later, unrelated `run_script()`/`call<>()` call - this works
+correctly by itself (see the `[coroutine]` tests in `test.cpp`) and is not
+a bug on its own.
+
+The actual risk only appears when a suspended coroutine's body calls into
+an `expose_func`/`expose_method`/`expose_mutable_method` closure whose
+captured C++ state has a shorter lifetime than the coroutine itself - i.e.
+the same raw-reference-capture hazard as item 1, just reachable via a
+coroutine resumed after the closure's referent is already gone, rather
+than via a direct call:
+
+```cpp
+// Owner destroyed while a coroutine that calls into its closure is still
+// suspended:
+{
+    Sensor sensor;
+    lua.expose_func<int>("read", std::function<int()>([&sensor]{ return sensor.read(); }));
+    lua.run_script("co = coroutine.create(function() return read() end)");
+    // sensor destroyed here (end of scope)
+}
+lua.run_script("coroutine.resume(co)"); // UB: calls into a destroyed `sensor`
+```
 
 **Mitigations available today:**
 
+- Use the `std::shared_ptr<Owner>` overloads of `expose_func`/
+  `expose_method` (item 1) instead of raw reference captures - the closure
+  keeps `owner` alive for as long as it is registered, regardless of
+  when/whether a coroutine resumes it.
 - Sandbox: construct with a `LuaLib` bitmask that excludes
   `LuaLib::Coroutine` (see the Sandboxing section of `README.md`) if
-  coroutines are not needed by the embedding scripts.
-- If coroutines are required, the `weak_ptr` trampoline from item 2
-  ensures that resuming a stale coroutine raises a catchable Lua error
-  rather than crashing, as long as the referenced closures are still
-  registered (see item 2 for the current limits of that protection).
+  coroutines are not needed by the embedding scripts - the simplest
+  concrete mitigation available today.
+- The `weak_ptr` trampoline from item 2 only guards against the
+  *registered `LuaFunc` object itself* being destroyed. Since nothing in
+  the public API currently removes an entry from `registered_funcs` before
+  the whole `Lua` instance is destroyed, this protection is presently
+  dormant/forward-looking - it does **not** protect against a captured raw
+  reference to some *other* object (like `sensor` above) going stale, which
+  is the scenario that actually matters for coroutines.
+- `close()` nils out `expose_func`-registered globals and forces a GC
+  cycle, but it does not proactively find and invalidate coroutines
+  holding references to those closures elsewhere (e.g. stored under a
+  different, non-tracked global or as an upvalue) - such a coroutine could
+  still resume and call the closure after `close()` if it remains reachable
+  from some other root and survives the forced GC pass.

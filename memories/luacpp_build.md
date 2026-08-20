@@ -1075,6 +1075,44 @@ comment-only changes, no functional/test impact (didn't re-run full ctest
 since nothing but comments/markdown changed, but confirmed compile-clean
 for lua_static/luacpp_example/luacpp_tests).
 
+## Expanded LIFETIME.md item 5 (coroutines) with post-run_script pitfall detail
+
+User asked "what are the current pitfalls with coroutines once run_script()
+has returned, if any?" - answered, then asked to add it to LIFETIME.md.
+Committed as 786f545. Key content added to item 5:
+
+- LuaCpp has no dedicated coroutine API; a `coroutine.create` result is an
+  ordinary Lua value, so it survives across separate run_script()/call<>()
+  calls for as long as the underlying lua_State exists (one Lua instance =
+  one shared state across all calls). Creating+suspending a coroutine in
+  one run_script() call and resuming it in a later, unrelated call works
+  correctly by itself (covered by [coroutine] tests in test.cpp) - NOT a
+  bug on its own.
+- The real risk: a suspended coroutine's body calling into an
+  expose_func/expose_method/expose_mutable_method closure whose captured
+  C++ state has a shorter lifetime than the coroutine - same raw-
+  reference-capture hazard as item 1, just reachable via a coroutine
+  resumed later rather than a direct call. Added a concrete code example
+  (Sensor destroyed at end of scope, then coroutine resumed later calls
+  the now-dangling closure).
+- Mitigations, current limits spelled out:
+  - shared_ptr<Owner> overloads (item 1) - the real fix, keeps owner alive
+    regardless of coroutine resume timing.
+  - LuaLib::Coroutine exclusion via sandboxing - simplest available today.
+  - weak_ptr trampoline (item 2) only guards the registered LuaFunc object
+    itself being destroyed - since nothing in the public API currently
+    prunes registered_funcs before Lua's own destruction, this is
+    dormant/forward-looking and does NOT protect against a captured raw
+    reference to some OTHER object going stale (the actual coroutine
+    scenario).
+  - close() nils expose_func globals + forces GC, but doesn't proactively
+    find/invalidate coroutines holding closure references elsewhere (e.g.
+    a different untracked global or an upvalue) - such a coroutine could
+    still resume and call the closure after close() if it survives the
+    forced GC pass via some other root.
+
+Docs-only change, no code touched.
+
 ## Status as of last update
 Simplified to single-unity-TU + /EHa fix, WITHOUT LUA_USE_LONGJMP (Lua
 uses native C++ exceptions for error handling). Verified locally on
