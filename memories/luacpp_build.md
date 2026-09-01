@@ -5,7 +5,39 @@ history of this project's build/feature work. This repo-tracked copy exists
 so memory content can be included in commits; sync it from the memory-tool
 file whenever asked to "include memory in the commit".
 
-## Latest update: expose_namespace extended with owner keep-alive overloads
+## Latest update: CodeQL merged into ci.yml as a job (not a separate workflow)
+
+Initial approach (added, then superseded within the same session before
+ever being committed): a standalone `.github/workflows/codeql.yml` file
+with its own triggers (push/pull_request to `main` + weekly cron) and a
+separate `[![CodeQL]]` README badge.
+
+Final approach, per explicit follow-up ("make codeql part of the regular
+workflow instead of a separate build"): deleted `codeql.yml` entirely and
+added a `codeql` job directly inside the existing `.github/workflows/ci.yml`
+(alongside the `test` matrix job), so it shares `ci.yml`'s existing
+triggers (plain `push`/`pull_request`, no branch filter, no schedule) rather
+than having its own. The README's existing single `[![CI]]` badge now
+covers both jobs, so no separate badge was added/kept. `codeql` job details
+(unchanged from the standalone version): `runs-on: ubuntu-latest`,
+`permissions: security-events: write, contents: read`, steps
+`actions/checkout@v7` -> `lukka/get-cmake@latest` ->
+`github/codeql-action/init@v4` (languages: cpp) -> manual `cmake -B build
+-DCMAKE_BUILD_TYPE=Release` + `cmake --build build` (not autobuild, so it
+traces the same compile invocations as the `test` job - notably Lua
+compiled as C++ via the single unity wrapper TU) -> `github/codeql-action/
+analyze@v4` (category `/language:cpp`). Note: user corrected an initial v3
+pin to v4 (the latest `codeql-action` major version) before this was
+committed.
+
+Net tracked-file diff for this whole CodeQL effort ended up being just the
+new `codeql` job appended to `ci.yml` - the README badge add+revert and the
+codeql.yml create+delete cancelled out to no diff, since none of that was
+committed before the "merge into regular workflow" follow-up arrived.
+Purely additive/CI-only change - no source, test, or build-affecting files
+touched; full suite unaffected: 269/269 passing (1267 assertions).
+
+## Prior update: expose_namespace extended with owner keep-alive overloads
 
 Closed the previously-noted gap ("no keep_alive() overload for
 expose_namespace yet"). `expose_namespace` now has the same three-overload
