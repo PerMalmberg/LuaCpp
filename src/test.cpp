@@ -1637,7 +1637,7 @@ TEST_CASE("duplicate method: error message names the conflicting method", "[expo
 }
 
 // ============================================================
-// New struct types: container-valued fields
+// Struct fields with container types (std::vector, std::map/unordered_map)
 // ============================================================
 
 struct Bag
