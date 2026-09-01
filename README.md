@@ -407,6 +407,67 @@ lua.expose_func<Point>("point",
 lua.run_script("local p = point(3, 4)");
 ```
 
+**Data-centric XML tree** - a common real-world use of struct binding is
+exchanging tree-shaped, attribute-bearing data (a simplified XML/DOM-like
+document) with Lua. Combine a `std::unordered_map<std::string, std::string>`
+for attributes with a **self-referential `std::vector<T>`** for children:
+
+```cpp
+struct XmlNode
+{
+    std::string name;
+    std::string text;
+    std::unordered_map<std::string, std::string> attributes;
+    std::vector<XmlNode> children; // self-referential - see note below
+};
+LUA_REGISTER_STRUCT(XmlNode,
+    lua_field("name",       &XmlNode::name),
+    lua_field("text",       &XmlNode::text),
+    lua_field("attributes", &XmlNode::attributes),
+    lua_field("children",   &XmlNode::children))
+```
+
+Note `children` is `std::vector<XmlNode>`, **not** `std::vector<XmlNode*>`.
+Struct exchange with Lua is always by value - there is no code path that turns
+a Lua table into a raw pointer (and there shouldn't be: who would own/free
+it?). A Lua table already has value/tree semantics, so a vector of values is
+the natural fit, not a compromise. The self-referential member compiles
+because C++17 permits `std::vector<T>` to be declared with an incomplete `T`,
+as long as `T` is complete by the time the vector's own operations are
+instantiated - true here since `LUA_REGISTER_STRUCT(XmlNode, ...)` (and the
+first real use of the type) both come after the struct's closing brace.
+
+This models a **data-centric** subset of XML - attributes plus nested
+elements plus optional leaf text - not a fully general document: mixed
+content (interleaved text and child elements in a specific order), comments,
+CDATA sections, and processing instructions have no representation here.
+For that data-centric subset, everything above works exactly as with any
+other registered struct, including edits made on the Lua side flowing back
+into the returned C++ value:
+
+```cpp
+lua.run_script(R"(
+    function recolor(n)
+        n.attributes.color = 'blue'
+        return n
+    end
+)");
+
+XmlNode node;
+node.name = "shape";
+node.attributes = {{"color", "red"}};
+
+auto [ok, err, result] = lua.call<XmlNode>("recolor", node);
+// result.attributes.at("color") == "blue"
+```
+
+Appending a child, editing a deeply nested grandchild's field, building a
+node from a Lua table literal, and passing/returning a
+`std::vector<XmlNode>` of sibling top-level nodes all work the same way -
+see the `[xml]`-tagged tests in `src/test.cpp` for full, runnable examples of
+each case (including a recursive `expose_func` that flattens an
+Lua-constructed tree into a name list entirely in C++).
+
 ---
 
 ### expose_func

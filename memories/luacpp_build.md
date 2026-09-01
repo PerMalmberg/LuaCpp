@@ -5,7 +5,54 @@ history of this project's build/feature work. This repo-tracked copy exists
 so memory content can be included in commits; sync it from the memory-tool
 file whenever asked to "include memory in the commit".
 
-## Latest update: expose_mutable_method extended with owner keep-alive overloads
+## Latest update: data-centric XML tree struct-binding tests + README section
+
+User asked whether a tree-shaped class (tag name, string attributes map,
+list of child pointers) could be exchanged with Lua tables. Answer: yes,
+but `std::vector<Node*>` must become `std::vector<Node>` - struct exchange
+is always by value (no code path turns a Lua table into a raw pointer), and
+a self-referential `std::vector<T>` member is legal C++17 (incomplete type
+at declaration, complete by first use after the class body closes).
+Registered a new `XmlNode` struct (`name`, `text`,
+`unordered_map<string,string> attributes`, `vector<XmlNode> children`) in
+`src/test.cpp` right after the existing `Bag`/`Registry` container-field
+struct examples, tagged `[struct][xml]`, with 9 new TEST_CASEs (34
+assertions): reading nested fields/attributes from a C++-built tree in Lua;
+attribute value changed in Lua reflected back via `call<XmlNode>`; new
+attribute added in Lua; child appended in Lua (table literal via
+`n.children[#n.children+1] = {...}`); a grandchild's field edited 2 levels
+deep round-tripping through the whole tree; a node built entirely as a Lua
+table literal read back correctly; empty attributes/children round-trip
+without error; a `std::vector<XmlNode>` of sibling top-level nodes; and a
+recursive `expose_func` (a `std::function` capturing itself by reference)
+that flattens an Lua-table-literal-built tree into a depth-first name list
+entirely in C++. Explicitly does NOT model real mixed-content XML
+(interleaved text/element order, comments, CDATA, processing
+instructions) - documented as a known limitation, both in the test file
+comment block and in the new README section. Full suite: 257/257 passing
+(1234 assertions, up from 248/~1200).
+
+Added a matching README section (in "Struct Binding", right after the
+existing "Construction from Lua" struct example, before the `expose_func`
+heading): explains the `XmlNode` shape, the vector<Node*>-to-vector<Node>
+value-semantics point, the C++17 incomplete-type-in-vector justification,
+the "data-centric subset only" caveat, and a short attribute-mutation
+round-trip code sample, pointing to the `[xml]`-tagged tests for full
+runnable examples.
+
+Follow-up: user asked to use `R"(...)"` raw string literals instead of
+concatenated `"..." "..."` string literals for embedded Lua source, matching
+the pre-existing style used elsewhere in `test.cpp` (e.g. "struct: nested
+struct round-trip" at the time used `R"( ... )"` with tab-indented Lua
+inside). Converted all 8 `lua.run_script(...)` calls across the new `[xml]`
+tests to raw strings (tab-indented Lua body between `R"(` / `)"`), and fixed
+a brace/`end`-matching mistake introduced during that conversion in the
+"build tree + flatten via expose_func" test (dropped closing `}` and `end`
+for the `build()` function). Also updated the matching README code sample
+to raw-string form for consistency. Re-verified: full rebuild, `[xml]`
+tests 9/9 (34 assertions), full suite 257/257 (1234 assertions).
+
+## Prior update: expose_mutable_method extended with owner keep-alive overloads
 
 Closed a previously-noted gap: `expose_mutable_method` now has the same
 three-overload shape as `expose_func`/`expose_method` - no-owner,
@@ -62,7 +109,7 @@ owners) - see the memory-tool file for full details of each step.
      possible/needed).
   5) coroutine resumption after C++ teardown - same hazard as item 1,
      reachable via a resumed coroutine instead of a direct call.
-- Full test suite is currently 248/248 passing.
+- Full test suite is currently 257/257 passing (1234 assertions).
 
 ## Named recurring magic numbers in Lua.hpp
 

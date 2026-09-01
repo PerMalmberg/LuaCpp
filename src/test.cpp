@@ -1653,6 +1653,257 @@ struct Registry
 LUA_REGISTER_STRUCT(Registry, lua_field("entries", &Registry::entries))
 
 // ============================================================
+// Data-centric XML tree (recursive struct + map + vector fields)
+//
+// Demonstrates using LUA_REGISTER_STRUCT to model a simplified,
+// data-oriented XML element: a tag name, optional text content, a bag
+// of string attributes, and a list of child elements. `children` is
+// std::vector<XmlNode> (a self-referential member) rather than
+// std::vector<XmlNode*> - struct exchange with Lua is always by value,
+// so pointers have no meaning here; a Lua table naturally has value/tree
+// semantics anyway, and std::vector<T> is permitted to have an
+// incomplete T at the point of member declaration in C++17, becoming
+// complete by the time it's actually used (after the class body closes).
+//
+// This does NOT model real mixed-content XML (interleaved text/element
+// children in document order, comments, CDATA, processing instructions)
+// - only the "data document" subset: attributes + nested elements +
+// optional leaf text.
+// ============================================================
+
+struct XmlNode
+{
+    std::string name;
+    std::string text;
+    std::unordered_map<std::string, std::string> attributes;
+    std::vector<XmlNode> children;
+};
+LUA_REGISTER_STRUCT(XmlNode,
+                    lua_field("name", &XmlNode::name),
+                    lua_field("text", &XmlNode::text),
+                    lua_field("attributes", &XmlNode::attributes),
+                    lua_field("children", &XmlNode::children))
+
+TEST_CASE("xml: struct passed as argument, fields readable in Lua", "[struct][xml]")
+{
+    Lua lua;
+    lua.run_script(R"(
+		function describe(n)
+			assert(n.name == 'book')
+			assert(n.attributes.id == '42')
+			assert(n.attributes.lang == 'en')
+			assert(#n.children == 2)
+			assert(n.children[1].name == 'title')
+			assert(n.children[1].text == 'LuaCpp')
+			assert(n.children[2].name == 'author')
+			assert(n.children[2].text == 'Someone')
+			return true
+		end
+	)");
+
+    XmlNode book;
+    book.name = "book";
+    book.attributes = {{"id", "42"}, {"lang", "en"}};
+    XmlNode title;
+    title.name = "title";
+    title.text = "LuaCpp";
+    XmlNode author;
+    author.name = "author";
+    author.text = "Someone";
+    book.children = {title, author};
+
+    auto [ok, err, result] = lua.call<bool>("describe", book);
+    REQUIRE(ok);
+    REQUIRE(result);
+}
+
+TEST_CASE("xml: attribute changed in Lua is reflected back in the returned C++ struct", "[struct][xml]")
+{
+    Lua lua;
+    lua.run_script(R"(
+		function recolor(n)
+			n.attributes.color = 'blue'
+			return n
+		end
+	)");
+
+    XmlNode node;
+    node.name = "shape";
+    node.attributes = {{"color", "red"}};
+
+    auto [ok, err, result] = lua.call<XmlNode>("recolor", node);
+    REQUIRE(ok);
+    REQUIRE(result.name == "shape");
+    REQUIRE(result.attributes.at("color") == "blue");
+}
+
+TEST_CASE("xml: new attribute added in Lua is present on return", "[struct][xml]")
+{
+    Lua lua;
+    lua.run_script(R"(
+		function tag(n)
+			n.attributes.checked = 'true'
+			return n
+		end
+	)");
+
+    XmlNode node;
+    node.name = "item";
+
+    auto [ok, err, result] = lua.call<XmlNode>("tag", node);
+    REQUIRE(ok);
+    REQUIRE(result.attributes.count("checked") == 1);
+    REQUIRE(result.attributes.at("checked") == "true");
+}
+
+TEST_CASE("xml: child appended in Lua is reflected back in the returned C++ struct", "[struct][xml]")
+{
+    Lua lua;
+    lua.run_script(R"(
+		function add_child(n)
+			n.children[#n.children + 1] = {name = 'new_child', text = 'hi', attributes = {}, children = {}}
+			return n
+		end
+	)");
+
+    XmlNode node;
+    node.name = "parent";
+    XmlNode existing;
+    existing.name = "existing";
+    node.children = {existing};
+
+    auto [ok, err, result] = lua.call<XmlNode>("add_child", node);
+    REQUIRE(ok);
+    REQUIRE(result.children.size() == 2);
+    REQUIRE(result.children[0].name == "existing");
+    REQUIRE(result.children[1].name == "new_child");
+    REQUIRE(result.children[1].text == "hi");
+}
+
+TEST_CASE("xml: a grandchild's field edited in Lua round-trips through the whole tree", "[struct][xml]")
+{
+    Lua lua;
+    lua.run_script(R"(
+		function edit_grandchild(n)
+			n.children[1].children[1].text = 'edited'
+			return n
+		end
+	)");
+
+    XmlNode grandchild;
+    grandchild.name = "leaf";
+    grandchild.text = "original";
+    XmlNode child;
+    child.name = "branch";
+    child.children = {grandchild};
+    XmlNode root;
+    root.name = "root";
+    root.children = {child};
+
+    auto [ok, err, result] = lua.call<XmlNode>("edit_grandchild", root);
+    REQUIRE(ok);
+    REQUIRE(result.children.size() == 1);
+    REQUIRE(result.children[0].children.size() == 1);
+    REQUIRE(result.children[0].children[0].text == "edited");
+}
+
+TEST_CASE("xml: node built entirely from a Lua table literal reads correctly in C++", "[struct][xml]")
+{
+    Lua lua;
+    lua.run_script(R"(
+		function make()
+			return {
+				name = 'root', text = '', attributes = {a = '1'}, children = {
+					{name = 'child', text = 'leaf text', attributes = {}, children = {}}
+				}
+			}
+		end
+	)");
+
+    auto [ok, err, node] = lua.call<XmlNode>("make");
+    REQUIRE(ok);
+    REQUIRE(node.name == "root");
+    REQUIRE(node.attributes.at("a") == "1");
+    REQUIRE(node.children.size() == 1);
+    REQUIRE(node.children[0].name == "child");
+    REQUIRE(node.children[0].text == "leaf text");
+}
+
+TEST_CASE("xml: empty attributes and childless nodes round-trip without error", "[struct][xml]")
+{
+    Lua lua;
+    lua.run_script(R"(function identity(n) return n end)");
+
+    XmlNode leaf;
+    leaf.name = "empty";
+    // attributes and children left default-constructed (empty)
+
+    auto [ok, err, result] = lua.call<XmlNode>("identity", leaf);
+    REQUIRE(ok);
+    REQUIRE(result.name == "empty");
+    REQUIRE(result.text.empty());
+    REQUIRE(result.attributes.empty());
+    REQUIRE(result.children.empty());
+}
+
+TEST_CASE("xml: a list of sibling top-level nodes round-trips via std::vector<XmlNode>", "[struct][xml]")
+{
+    Lua lua;
+    lua.run_script(R"(
+		function siblings()
+			return {
+				{name = 'first', text = '', attributes = {}, children = {}},
+				{name = 'second', text = '', attributes = {}, children = {}}
+			}
+		end
+	)");
+
+    auto [ok, err, nodes] = lua.call<std::vector<XmlNode>>("siblings");
+    REQUIRE(ok);
+    REQUIRE(nodes.size() == 2);
+    REQUIRE(nodes[0].name == "first");
+    REQUIRE(nodes[1].name == "second");
+}
+
+TEST_CASE("xml: expose_func can recursively flatten a tree built as a Lua table literal", "[struct][xml][expose_func]")
+{
+    Lua lua;
+
+    // Recursive C++ lambda (captures itself by reference) exposed to Lua as
+    // a single callable - walks children in order, depth-first.
+    std::function<std::vector<std::string>(XmlNode)> collect_names;
+    collect_names = [&collect_names](XmlNode n) -> std::vector<std::string>
+    {
+        std::vector<std::string> result{n.name};
+        for(const auto& child : n.children)
+        {
+            auto sub = collect_names(child);
+            result.insert(result.end(), sub.begin(), sub.end());
+        }
+        return result;
+    };
+    lua.expose_func<std::vector<std::string>>("collect_names", collect_names);
+
+    lua.run_script(R"(
+		function build()
+			return {
+				name = 'root', text = '', attributes = {}, children = {
+					{name = 'a', text = '', attributes = {}, children = {}},
+					{name = 'b', text = '', attributes = {}, children = {
+						{name = 'c', text = '', attributes = {}, children = {}}
+					}}
+				}
+			}
+		end
+		function flat() return collect_names(build()) end
+	)");
+
+    auto [ok, err, names] = lua.call<std::vector<std::string>>("flat");
+    REQUIRE(ok);
+    REQUIRE(names == std::vector<std::string>{"root", "a", "b", "c"});
+}
+
+// ============================================================
 // assign - remaining supported types
 // ============================================================
 
