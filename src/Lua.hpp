@@ -121,6 +121,47 @@ struct has_lua_fields<T, std::void_t<decltype(LuaFields<T>::value)>> : std::true
     };
 
 // ---------------------------------------------------------------------------
+// Module (namespace-table) registration - see Lua::expose_namespace()
+//
+// Describes a single named function destined to become a field of a Lua
+// module table, e.g. lua_module_func<bool, std::string>("replace", ...)
+// becomes the `replace` field of whatever table expose_namespace() builds.
+// ReturnTypes follows the same convention as expose_func<>/call<>: omit for
+// void, one type for a scalar return, multiple for a std::tuple<Ts...>.
+// Args is deduced from the std::function argument, exactly like expose_func.
+//
+// Primary template intentionally left undefined; only the partial
+// specialisation below (matching the tuple-wrapped parameter packs produced
+// by lua_module_func()) is ever instantiated.
+// ---------------------------------------------------------------------------
+template <typename ReturnTuple, typename ArgTuple>
+struct LuaModuleFunc;
+
+template <typename... ReturnTypes, typename... Args>
+struct LuaModuleFunc<std::tuple<ReturnTypes...>, std::tuple<Args...>>
+{
+    const char* name;
+    std::function<lua_return_t<ReturnTypes...>(Args...)> func;
+};
+
+// Builds a LuaModuleFunc entry for use with Lua::expose_namespace(). ReturnTypes
+// must be given explicitly (as with expose_func<>); Args is deduced from func.
+//
+// Example:
+//   lua.expose_namespace("ndi",
+//       lua_module_func<std::vector<XmlNode>>("find",
+//           std::function<std::vector<XmlNode>(std::unordered_map<std::string,std::string>)>(...)),
+//       lua_module_func<bool, std::string>("replace", std::function<...>(...)),
+//       lua_module_func<>("append", std::function<void(std::vector<XmlNode>)>(...)));
+template <typename... ReturnTypes, typename... Args>
+constexpr LuaModuleFunc<std::tuple<ReturnTypes...>, std::tuple<Args...>> lua_module_func(
+const char* name,
+std::function<lua_return_t<ReturnTypes...>(Args...)> func)
+{
+    return {name, std::move(func)};
+}
+
+// ---------------------------------------------------------------------------
 // Standard container traits
 // Used by push()/read() to detect std::vector and std::map/unordered_map.
 // T::value_type, T::key_type and T::mapped_type are used to recurse into
@@ -725,6 +766,99 @@ class Lua final
                      std::function<lua_return_t<ReturnTypes...>(Args...)> func)
     {
         register_global_func(name, make_func_wrapper<ReturnTypes...>(std::move(func), std::move(owners)));
+    }
+
+    // Registers a group of C++ callables as fields of a single Lua global
+    // table (a "module"/"namespace"), rather than as separate flat globals.
+    // Each entry is built with lua_module_func<ReturnTypes...>("field_name",
+    // std::function<sig>(...)) - see its documentation above for the exact
+    // convention. Entries may have entirely different signatures from one
+    // another; each is registered independently, exactly as if it had been
+    // passed to expose_func() on its own, except the resulting closure is
+    // stored as `module_name.field_name` instead of a bare global.
+    //
+    // Example:
+    //   lua.expose_namespace("example_ns",
+    //       lua_module_func<std::vector<XmlNode>>("find",
+    //           std::function<std::vector<XmlNode>(std::unordered_map<std::string,std::string>)>(
+    //               [](std::unordered_map<std::string,std::string> params) { ... })),
+    //       lua_module_func<bool, std::string>("replace",
+    //           std::function<std::tuple<bool,std::string>(std::unordered_map<std::string,std::string>,
+    //                                                        std::vector<XmlNode>)>(
+    //               [](auto params, auto new_data) { ... })),
+    //       lua_module_func<>("append",
+    //           std::function<void(std::vector<XmlNode>)>([](std::vector<XmlNode> new_data) { ... })));
+    //   lua.run_script("local found = example_ns.find({element_name = 'Hardware'})");
+    //
+    // Like expose_func(), the resulting global (`module_name`) is protected
+    // against script-side overwrite by default, and is nil'd out by close().
+    // Re-calling expose_namespace() with the same module_name replaces the
+    // whole table, exactly like re-registering a flat expose_func() global.
+    //
+    // Pitfalls (same as expose_func()):
+    //   - Each callable must be wrapped in std::function.
+    //   - Lambda captures that hold references must outlive the Lua instance;
+    //     value captures are always safe. If a reference capture is needed,
+    //     use one of the owner-keeping overloads below so the referent's
+    //     lifetime is tied to the whole module's registered closures instead.
+    //   - Registering a module_name that already exists as a Lua global
+    //     silently replaces it; no warning is produced.
+    //
+    // Implemented in terms of the keep_alive() overload further below (with an
+    // empty owner list) so there is only one real registration code path for
+    // expose_namespace, regardless of how many owners (zero, one, or several)
+    // are involved - exactly like expose_func().
+    template <typename... Entries>
+    void expose_namespace(const char* module_name, Entries... entries)
+    {
+        expose_namespace(module_name, keep_alive(), std::move(entries)...);
+    }
+
+    // Same as expose_namespace above, but keeps `owner` alive for as long as
+    // ALL of the module's registered closures exist (i.e. for the lifetime of
+    // this Lua instance, or until module_name is replaced/erased). Use this
+    // overload whenever any entry's callable captures a reference to *owner,
+    // or to something owned by it - the shared_ptr copy captured inside every
+    // entry's closure keeps the object alive even if all other owners release
+    // it. Implemented in terms of the keep_alive() overload below (wraps
+    // `owner` in a 1-element tuple) - kept as its own overload purely so the
+    // common single-owner case doesn't require an explicit keep_alive() call
+    // at the use site.
+    //
+    // Example:
+    //   auto document = std::make_shared<std::vector<XmlNode>>();
+    //   lua.expose_namespace("example_ns", document,
+    //       lua_module_func<std::vector<XmlNode>>("find",
+    //           std::function<std::vector<XmlNode>(std::unordered_map<std::string,std::string>)>(
+    //               [doc = document.get()](std::unordered_map<std::string,std::string> params) { ... })));
+    template <typename Owner, typename... Entries>
+    void expose_namespace(const char* module_name, std::shared_ptr<Owner> owner, Entries... entries)
+    {
+        expose_namespace(module_name, keep_alive(std::move(owner)), std::move(entries)...);
+    }
+
+    // Same as expose_namespace(module_name, owner, entries...) above, but
+    // keeps MULTIPLE owners alive for as long as ALL of the module's
+    // registered closures exist, for callables whose captures reference more
+    // than one shorter-lived object. Bundle the owners with the keep_alive()
+    // helper - each is copied by value into every entry's closure alongside
+    // its function, exactly like the single-owner overload. This is the one
+    // real implementation shared by all three expose_namespace() overloads.
+    //
+    // Example:
+    //   auto document = std::make_shared<std::vector<XmlNode>>();
+    //   auto logger = std::make_shared<Logger>();
+    //   lua.expose_namespace("example_ns", Lua::keep_alive(document, logger),
+    //       lua_module_func<>("append", std::function<void(std::vector<XmlNode>)>(
+    //           [doc = document.get(), log = logger.get()](std::vector<XmlNode> new_data) { ... })));
+    template <typename... Owners, typename... Entries>
+    void expose_namespace(const char* module_name, std::tuple<std::shared_ptr<Owners>...> owners, Entries... entries)
+    {
+        lua_newtable(*this); // stack: [table]
+        (register_module_entry(std::move(entries), owners), ...); // each leaves the table on top
+        write_real_global(module_name); // pops table; bypasses protection - trusted C++ call
+        registered_global_names.emplace_back(module_name);
+        protected_globals.insert(module_name); // protect it from script-side overwrite by default
     }
 
     // Registers a C++ callable as a named method on all Lua instances of StructType.
@@ -1350,6 +1484,29 @@ class Lua final
         lua_pushcclosure(*this, &Lua::trampoline, WEAK_FUNC_UPVALUE_COUNT);
         write_real_global(name); // bypass protection - this is a trusted C++ call
         protected_globals.insert(name); // protect it from script-side overwrite by default
+    }
+
+    // Builds a wrapper closure for one LuaModuleFunc entry and stores it as a
+    // field of the table currently on top of the Lua stack (used by
+    // expose_namespace() - one call per entry, table left on top throughout).
+    // `keep_alive` is the same tuple passed to every entry in the module (see
+    // expose_namespace's keep_alive-tuple overload) - passed by const& and
+    // copied into make_func_wrapper for each entry, since a single tuple of
+    // shared_ptr owners is shared across all of a module's entries (copying a
+    // shared_ptr is a cheap refcount bump). Unlike register_global_func(), the
+    // resulting closure is never itself a Lua global, so it is not added to
+    // registered_global_names/protected_globals - only the module table as a
+    // whole is (see expose_namespace()).
+    template <typename... ReturnTypes, typename... Args, typename KeepAlive>
+    void register_module_entry(LuaModuleFunc<std::tuple<ReturnTypes...>, std::tuple<Args...>> entry,
+                               const KeepAlive& keep_alive)
+    {
+        std::shared_ptr<LuaFunc> fn(make_func_wrapper<ReturnTypes...>(std::move(entry.func), keep_alive));
+        registered_funcs.push_back(fn);
+
+        push_weak_upvalue(*this, fn); // stack: [table, upvalue]
+        lua_pushcclosure(*this, &Lua::trampoline, WEAK_FUNC_UPVALUE_COUNT); // stack: [table, closure]
+        lua_setfield(*this, -2, entry.name); // table[entry.name] = closure; pops closure; table remains
     }
 
     // Builds the typed trampoline closure shared by both expose_method overloads.

@@ -26,6 +26,7 @@ and from Lua scripts with automatic type checking and clear error messages.
   - [expose\_func](#expose_func)
   - [expose\_method](#expose_method)
   - [expose\_mutable\_method](#expose_mutable_method)
+  - [expose\_namespace](#expose_namespace)
   - [Exception Handling](#exception-handling)
   - [Sandboxing](#sandboxing)
   - [Call Tracing](#call-tracing)
@@ -141,6 +142,7 @@ to trace back to the build configuration. Checklist:
    block, their *definitions* get C++ name-mangled and every call from
    `Lua.hpp` fails to link. The simplest approach (and what this project's
    own `CMakeLists.txt` does) is a single generated wrapper translation unit:
+
    ```cpp
    // lua_cxx_unity.cpp
    extern "C" {
@@ -149,6 +151,7 @@ to trace back to the build configuration. Checklist:
    // ... one #include per Lua .c source (except lua.c/luac.c) ...
    }
    ```
+
    compiled as a single C++ TU. Compiling each `.c` file individually and
    linking the objects together also works, as long as each one is wrapped
    in `extern "C"` and compiled as C++.
@@ -664,6 +667,119 @@ lua.expose_mutable_method<Point>("bump_and_log", log,
 
 ---
 
+### expose_namespace
+
+```cpp
+lua.expose_namespace("module_name",
+    lua_module_func<ReturnTypes...>("field_name", std::function<sig>(...)),
+    ...);
+```
+
+Registers several C++ callables as fields of a single Lua global **table**
+(a "module" or "namespace"), instead of as separate flat globals. This is
+the pattern to reach for when a design calls for a small, grouped API
+surface like `example_ns.find(...)`, `example_ns.replace(...)`, `example_ns.append(...)` -
+`expose_func` alone cannot do this, since it only ever registers a single
+flat global per call (passing a dotted name such as `"example_ns.find"` would
+create one global literally named `"example_ns.find"`, not a `find` field on a
+table named `example_ns`).
+
+Each entry is described with `lua_module_func<ReturnTypes...>("field_name",
+std::function<sig>(...))`, using exactly the same `ReturnTypes...`
+convention as `expose_func`/`call<>` (omit for void, one type for a scalar
+return, multiple for a `std::tuple<Ts...>` return). Entries may have
+completely unrelated signatures from one another - each is built and
+invoked independently, exactly as if it had been registered with its own
+`expose_func` call:
+
+```cpp
+auto document = std::make_shared<std::vector<XmlNode>>();
+
+lua.expose_namespace("example_ns",
+    lua_module_func<std::vector<XmlNode>>("find",
+        std::function<std::vector<XmlNode>(std::unordered_map<std::string, std::string>)>(
+            [document](std::unordered_map<std::string, std::string> params) {
+                std::vector<XmlNode> result;
+                // ... match params against *document, e.g. params["element_name"]
+                // against each node's name and every other key against its attributes
+                return result;
+            })),
+    lua_module_func<bool, std::string>("replace",
+        std::function<std::tuple<bool, std::string>(std::unordered_map<std::string, std::string>,
+                                                     std::vector<XmlNode>)>(
+            [document](std::unordered_map<std::string, std::string> params,
+                       std::vector<XmlNode> new_data) -> std::tuple<bool, std::string> {
+                // ... remove matches from *document, insert new_data in their place
+                return {true, ""};
+            })),
+    lua_module_func<>("append",
+        std::function<void(std::vector<XmlNode>)>(
+            [document](std::vector<XmlNode> new_data) {
+                document->insert(document->end(), new_data.begin(), new_data.end());
+            })));
+
+lua.run_script("local found = example_ns.find({element_name = 'Hardware'})");
+```
+
+Note `search_params` above is modeled as a plain
+`std::unordered_map<std::string, std::string>`, not a `LUA_REGISTER_STRUCT`
+struct - a registered struct requires every declared field to be present in
+the Lua table on every call, which doesn't fit "pass whichever criteria you
+want" search semantics. A plain map argument has no such requirement; a
+partial or even empty table is read as a partial or empty map, exactly like
+any other registered struct's map-typed field (e.g. `XmlNode::attributes`).
+The map's value type must be uniform (here, `std::string`) - numeric-looking
+criteria such as an `id` should be passed as strings from Lua, the same
+convention already used for XML attributes.
+
+Like `expose_func`, the resulting module global is protected against
+script-side overwrite by default, and is nil'd out by `close()`. Re-calling
+`expose_namespace()` with the same module name replaces the whole table.
+
+If any entry's callable captures a reference to a shorter-lived object,
+`expose_namespace` has the same `std::shared_ptr<Owner>` and
+`Lua::keep_alive()` overloads as `expose_func`/`expose_method`/
+`expose_mutable_method` - the owner(s) are kept alive for as long as **any**
+of the module's entries exist (they share one copy of the same owner tuple,
+not one copy each):
+
+```cpp
+auto document = std::make_shared<std::vector<XmlNode>>();
+
+lua.expose_namespace("example_ns", document, // single owner - shared by every entry below
+    lua_module_func<std::vector<XmlNode>>("find",
+        std::function<std::vector<XmlNode>(std::unordered_map<std::string, std::string>)>(
+            [doc = document.get()](std::unordered_map<std::string, std::string> params) {
+                std::vector<XmlNode> result;
+                // ... match params against *doc
+                return result;
+            })),
+    lua_module_func<>("append",
+        std::function<void(std::vector<XmlNode>)>(
+            [doc = document.get()](std::vector<XmlNode> new_data) {
+                doc->insert(doc->end(), new_data.begin(), new_data.end());
+            })));
+```
+
+For more than one shared owner, bundle them with `Lua::keep_alive()`, exactly
+like the other `expose_*` functions:
+
+```cpp
+lua.expose_namespace("example_ns", Lua::keep_alive(document, logger),
+    lua_module_func<>("append", std::function<void(std::vector<XmlNode>)>(
+        [doc = document.get(), log = logger.get()](std::vector<XmlNode> new_data) { ... })));
+```
+
+Pitfalls (same as `expose_func`):
+
+- Each callable must be wrapped in `std::function`.
+- Lambda captures that hold references must outlive the `Lua` instance;
+  value captures (including a `std::shared_ptr` captured by value, as in the
+  first example above) are always safe. If a reference capture is needed,
+  use one of the owner-keeping overloads above.
+
+---
+
 ### Exception Handling
 
 Any C++ exception deriving from `std::exception`, thrown from inside a
@@ -806,6 +922,7 @@ Reports internal LuaCpp problems that would otherwise be silent or only
 visible via a `{false, msg}` return tuple - e.g. an exception thrown by a
 call-trace callback, a `run_script`/`call<>` failure, or a memory-limit
 breach. Each message is `"[LuaCpp] "`-prefixed and **not** newline-terminated
+
 - the consumer's callback is responsible for its own line formatting.
 
 ```cpp

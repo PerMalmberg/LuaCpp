@@ -5,7 +5,143 @@ history of this project's build/feature work. This repo-tracked copy exists
 so memory content can be included in commits; sync it from the memory-tool
 file whenever asked to "include memory in the commit".
 
-## Latest update: data-centric XML tree struct-binding tests + README section
+## Latest update: expose_namespace extended with owner keep-alive overloads
+
+Closed the previously-noted gap ("no keep_alive() overload for
+expose_namespace yet"). `expose_namespace` now has the same three-overload
+shape as `expose_func`/`expose_method`/`expose_mutable_method`: a no-owner
+overload, a single-owner overload (`std::shared_ptr<Owner>`), and a
+multi-owner overload (`std::tuple<std::shared_ptr<Owners>...>` via
+`Lua::keep_alive()`) - the real implementation. Key difference from the
+other three functions: the owner(s) are shared across **every entry** in
+one `expose_namespace(...)` call (one copy of the keep_alive tuple, not one
+per entry), since a module conceptually groups several functions that
+often close over the same underlying object (e.g. a shared document).
+
+Implementation in `src/Lua.hpp`:
+- `register_module_entry(entry, const KeepAlive&)` (private) now takes the
+  keep_alive tuple by const& and forwards a copy into `make_func_wrapper`
+  for each entry (cheap - just shared_ptr refcount bumps).
+- `expose_namespace(module_name, entries...)` - delegates to
+  `expose_namespace(module_name, keep_alive(), entries...)`.
+- `expose_namespace(module_name, shared_ptr<Owner> owner, entries...)` -
+  delegates to `expose_namespace(module_name, keep_alive(std::move(owner)),
+  entries...)`.
+- `expose_namespace(module_name, tuple<shared_ptr<Owners>...> owners,
+  entries...)` - the one real registration path: builds the table, folds
+  `register_module_entry(entry, owners)` over every entry (owners copied,
+  not moved, since the same tuple is reused per entry), then
+  `write_real_global` + `registered_global_names`/`protected_globals` as
+  before.
+
+Added 2 new `[expose_namespace][lifetime]` tests in `src/test.cpp` (now 9
+`[expose_namespace]` tests total, 28 assertions): single-owner (`counter`
+dropped locally after registration, module's own shared_ptr copy keeps it
+alive across repeated calls to a wrapped `example_ns.bump()`), and
+multi-owner via `Lua::keep_alive(counter, multiplier)` with TWO entries
+(`bump_and_scale` and `peek`) in the same `expose_namespace` call, proving
+both entries share the *same* underlying counter instance (not independent
+copies) and both owners stay alive after the locals go out of scope.
+
+Updated the README "expose_namespace" section: replaced the "no
+keep_alive() overload yet" caveat with single-owner and
+`Lua::keep_alive()` multi-owner code examples (mirroring the
+`expose_mutable_method` README treatment), and updated the pitfalls list
+accordingly.
+
+Verified: full rebuild, `[expose_namespace]` tests 9/9 (28 assertions, up
+from 7/20), full suite 269/269 (1267 assertions, up from 267/1259).
+
+## Prior update: implemented expose_namespace/lua_module_func (the proposed
+## namespacing helper) with tests and README docs
+
+Implemented the module/namespace-table registration helper previously only
+proposed in discussion (for APIs like `ndi.find`/`ndi.replace`/
+`ndi.append`). New public surface in `src/Lua.hpp`:
+
+- `LuaModuleFunc<std::tuple<ReturnTypes...>, std::tuple<Args...>>` -
+  namespace-scope descriptor struct (primary template undefined; only the
+  tuple-wrapped partial specialization is instantiated) holding a
+  `const char* name` + `std::function<lua_return_t<ReturnTypes...>(Args...)>`.
+  Placed right after `LUA_REGISTER_STRUCT`'s macro definition.
+- `lua_module_func<ReturnTypes...>(name, func)` - free factory function
+  building one `LuaModuleFunc` entry; `ReturnTypes...` explicit (same
+  convention as `expose_func`/`call<>`), `Args...` deduced from `func`.
+- `Lua::expose_namespace(module_name, entries...)` - public variadic member
+  template. Pushes a fresh table, folds over `register_module_entry(...)`
+  for each entry (each may have a totally different signature from the
+  others - that's why LuaModuleFunc needs the tuple-wrapping trick, to let
+  a single parameter pack `Entries...` hold heterogeneously-typed
+  descriptors), then `write_real_global(module_name)` + adds the name to
+  `registered_global_names`/`protected_globals` - so the module table gets
+  the exact same overwrite-protection and `close()`-nils-it treatment as a
+  flat `expose_func` global.
+- `Lua::register_module_entry(LuaModuleFunc<...> entry)` (private) - mirrors
+  `register_global_func` but does `lua_setfield(table, entry.name)` instead
+  of `write_real_global`, and does NOT track the entry itself in
+  `registered_global_names`/`protected_globals` (only the module table as a
+  whole is tracked) - added right after `register_global_func` in the
+  source.
+- No `keep_alive()` overload for `expose_namespace` itself (documented as a
+  known limitation) - captures must be by-value (e.g. a `std::shared_ptr`
+  captured by value into each lambda, which is what the tests/README do);
+  an entry needing reference-owner keep-alive should be registered
+  individually via `expose_func` and spliced into the table with a small
+  `run_script()` instead.
+
+Added a `[struct][xml][expose_namespace]`-tagged block of 7 tests in
+`src/test.cpp` (right after the `expose_mutable_method` XmlNode tests, +20
+assertions): a shared `std::shared_ptr<std::vector<XmlNode>> document`
+captured by value in each closure models a tiny in-memory "database";
+`xml_node_matches()` (anonymous-namespace free function) matches
+`params["element_name"]` against `n.name` and every other key against
+`n.attributes`. Tests: `ndi.find` returns matching top-level nodes;
+`ndi.replace` removes matches + inserts new_data, returning `(true, "")`;
+`ndi.replace` returns `(false, "no matching nodes found")` when nothing
+matches; `ndi.append` adds without disturbing existing nodes; all three
+entries reachable as `type(ndi.find/replace/append) == 'function'` on one
+table; the `ndi` global itself is protected (`ndi = nil` rejected with
+"protected global"); `close()` nils `ndi` out like any other expose_func
+registration. Note: `call<>()` only takes a bare global name (no dotted
+paths), so each test defines a tiny Lua wrapper function
+(`do_find`/`do_replace`/`do_append`) that internally calls `ndi.xxx(...)`,
+then invokes that wrapper via `call<>()` - this is not a limitation of
+`expose_namespace` itself, just of how test bodies drive calls into
+dotted-path globals generically.
+
+Added a matching "### expose_namespace" README section (right after
+`expose_mutable_method`, before "### Exception Handling"): explains why
+`expose_func` alone can't do this (dotted name would literally become one
+flat global named `"ndi.find"`), documents `lua_module_func<ReturnTypes...>`
+convention, gives the full `ndi.find/replace/append` example against a
+shared `std::vector<XmlNode>` document, explains why `search_params` should
+be a plain `unordered_map<string,string>` rather than a
+`LUA_REGISTER_STRUCT` (partial-table matching vs. every-field-required
+struct semantics), and lists the same pitfalls as `expose_func` plus the
+"no keep_alive() overload yet" caveat.
+
+Verified: full rebuild, `[expose_namespace]` tests 7/7 (20 assertions),
+full suite 267/267 (1259 assertions, up from 260/1239). Used Python one-off
+scripts (via run_command) to splice large test/README blocks into place
+after insert_edit_into_file repeatedly failed to parse the JSON payload for
+this particular chunk (unescaped quotes inside code/comments in the
+newText) - written to a /tmp scratch file first, then spliced in with a
+short inline Python script matched against a stable surrounding-text
+marker, which was more reliable than manually escaping a large block by
+hand.
+
+Follow-up: user asked to rename the example module name "ndi" to
+"example_ns" throughout (both `src/test.cpp` and `README.md`). Done via
+targeted `sed -i '<line-range> s/\bndi\b/example_ns/g'` restricted to the
+exact line ranges containing the expose_namespace example/tests, since a
+blanket whole-file replace would have been safe anyway (word-boundary
+regex correctly skips substring false positives like "unwinding",
+"binding", "individually") but line-scoping was used as an extra
+precaution. Re-verified: full rebuild, `[expose_namespace]` tests still
+7/7 (20 assertions), full suite 267/267 (1259 assertions) - unchanged
+counts, purely a rename.
+
+## Prior update: data-centric XML tree struct-binding tests + README section
 
 User asked whether a tree-shaped class (tag name, string attributes map,
 list of child pointers) could be exchanged with Lua tables. Answer: yes,
@@ -141,7 +277,7 @@ owners) - see the memory-tool file for full details of each step.
      possible/needed).
   5) coroutine resumption after C++ teardown - same hazard as item 1,
      reachable via a resumed coroutine instead of a direct call.
-- Full test suite is currently 260/260 passing (1239 assertions).
+- Full test suite is currently 269/269 passing (1267 assertions).
 
 ## Named recurring magic numbers in Lua.hpp
 
