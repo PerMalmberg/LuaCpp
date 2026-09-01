@@ -5,7 +5,44 @@ history of this project's build/feature work. This repo-tracked copy exists
 so memory content can be included in commits; sync it from the memory-tool
 file whenever asked to "include memory in the commit".
 
-## Latest update: CodeQL merged into ci.yml as a job (not a separate workflow)
+## Latest update: corrected diagnosis - the failure was in the codeql job,
+## not the test job; fixed by disabling ASan there instead
+
+Initial (wrong) diagnosis: assumed the failure was in the `test` job's
+ubuntu-latest legs, attributed to a GitHub-image-update-induced ASan
+`verify_asan_link_order` false positive, and "fixed" it by adding
+`env: ASAN_OPTIONS: verify_asan_link_order=0` at the `test` job level.
+
+User corrected this: the `test` job's ubuntu-latest legs actually pass fine
+- only the `codeql` job's build fails. Re-diagnosed: `LUACPP_ENABLE_ASAN`
+defaults to `ON` whenever LuaCpp is the top-level CMake project (see
+`CMakeLists.txt`'s `LUACPP_IS_TOP_LEVEL` option defaults), which is true in
+*both* jobs - so ASan being enabled isn't the differentiator, since both
+jobs build with it ON. The actual differentiator: `github/codeql-action/
+init` installs a build tracer that, for every process spawned in the rest
+of that job, injects its own `LD_PRELOAD`-based interception mechanism so
+CodeQL can observe compiler/linker invocations for its extraction database.
+That tracer library loads ahead of `libasan.so` in the process's initial
+library list - which is exactly what trips ASan's `verify_asan_link_order`
+startup self-check. The plain `test` job has no such tracer, so
+`libasan.so` loads first there without issue, even with the identical
+`-DLUACPP_ENABLE_ASAN=ON`.
+
+Fix applied: reverted the `ASAN_OPTIONS` env block from the `test` job
+(unnecessary - it was never actually broken), and instead added
+`-DLUACPP_ENABLE_ASAN=OFF` to the `codeql` job's Configure step, with a
+comment explaining the tracer-vs-ASan conflict and noting CodeQL's static
+analysis only needs the code to compile (not run), so ASan brings no
+benefit there anyway. This is the more correct/minimal fix: it avoids
+fighting an inherent incompatibility (CodeQL tracer + ASan's LD_PRELOAD
+requirement) rather than trying to suppress just the symptom on the wrong
+job.
+
+Not independently verifiable in this sandboxed dev environment (no access
+to GitHub Actions runs) - reasoning is based on documented CodeQL tracer
+behavior and ASan's known startup self-check semantics.
+
+## Prior update: CodeQL merged into ci.yml as a job (not a separate workflow)
 
 Initial approach (added, then superseded within the same session before
 ever being committed): a standalone `.github/workflows/codeql.yml` file

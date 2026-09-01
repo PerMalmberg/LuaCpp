@@ -59,9 +59,16 @@ jobs:
       # Manual build (rather than autobuild) so CodeQL traces the exact same
       # compile invocations as the test job above - notably Lua compiled as
       # C++ via the single unity wrapper TU (see README.md's build
-      # troubleshooting section for why that matters).
+      # troubleshooting section for why that matters). ASan is explicitly
+      # disabled here (it otherwise defaults to ON for a top-level build,
+      # same as the test job) because CodeQL's build tracer - active for
+      # every process spawned after codeql-action/init - injects its own
+      # LD_PRELOAD interception ahead of libasan.so, which trips ASan's
+      # verify_asan_link_order startup self-check. CodeQL's static analysis
+      # only needs the code to compile, not to run, so ASan brings no benefit
+      # here anyway.
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLUACPP_ENABLE_ASAN=OFF
 
       - name: Build
         run: cmake --build build --config Release
