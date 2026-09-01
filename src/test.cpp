@@ -2021,6 +2021,64 @@ namespace
         }
         return true;
     }
+
+    // The three example_ns.* entries, factored out so every test below shares
+    // one implementation instead of repeating the same lambda bodies.
+    auto make_find_entry(std::shared_ptr<std::vector<XmlNode>> document)
+    {
+        return lua_module_func<
+        std::vector<XmlNode>>("find", std::function<std::vector<XmlNode>(std::unordered_map<std::string, std::string>)>(
+                                      [document](std::unordered_map<std::string, std::string> params)
+                                      {
+                                          std::vector<XmlNode> result;
+                                          for(const auto& n : *document)
+                                          {
+                                              if(xml_node_matches(n, params))
+                                              {
+                                                  result.push_back(n);
+                                              }
+                                          }
+                                          return result;
+                                      }));
+    }
+
+    auto make_replace_entry(std::shared_ptr<std::vector<XmlNode>> document)
+    {
+        return lua_module_func<
+        bool, std::string>("replace",
+                           std::function<std::tuple<bool, std::string>(std::unordered_map<std::string, std::string>,
+                                                                       std::vector<XmlNode>)>(
+                           [document](std::unordered_map<std::string, std::string> params,
+                                      std::vector<XmlNode> new_data) -> std::tuple<bool, std::string>
+                           {
+                               bool removed_any = false;
+                               for(auto it = document->begin(); it != document->end();)
+                               {
+                                   if(xml_node_matches(*it, params))
+                                   {
+                                       it = document->erase(it);
+                                       removed_any = true;
+                                   }
+                                   else
+                                   {
+                                       ++it;
+                                   }
+                               }
+                               if(!removed_any)
+                               {
+                                   return {false, "no matching nodes found"};
+                               }
+                               document->insert(document->end(), new_data.begin(), new_data.end());
+                               return {true, ""};
+                           }));
+    }
+
+    auto make_append_entry(std::shared_ptr<std::vector<XmlNode>> document)
+    {
+        return lua_module_func<>("append", std::function<void(std::vector<XmlNode>)>(
+                                           [document](std::vector<XmlNode> new_data)
+                                           { document->insert(document->end(), new_data.begin(), new_data.end()); }));
+    }
 } // namespace
 
 TEST_CASE("expose_namespace: example_ns.find returns top-level nodes matching search_params",
@@ -2036,23 +2094,7 @@ TEST_CASE("expose_namespace: example_ns.find returns top-level nodes matching se
     sw.attributes = {{"id", "2"}};
     *document = {hw, sw};
 
-    lua.expose_namespace("example_ns",
-                         lua_module_func<std::vector<XmlNode>>("find",
-                                                               std::function<std::vector<XmlNode>(
-                                                               std::unordered_map<std::string, std::string>)>(
-                                                               [document](
-                                                               std::unordered_map<std::string, std::string> params)
-                                                               {
-                                                                   std::vector<XmlNode> result;
-                                                                   for(const auto& n : *document)
-                                                                   {
-                                                                       if(xml_node_matches(n, params))
-                                                                       {
-                                                                           result.push_back(n);
-                                                                       }
-                                                                   }
-                                                                   return result;
-                                                               })));
+    lua.expose_namespace("example_ns", make_find_entry(document));
 
     lua.run_script("function do_find(p) return example_ns.find(p) end");
     auto [ok, err, found] =
@@ -2074,35 +2116,7 @@ TEST_CASE("expose_namespace: example_ns.replace removes matches and inserts new_
     hw.attributes = {{"id", "1"}};
     *document = {hw};
 
-    lua.expose_namespace("example_ns",
-                         lua_module_func<
-                         bool, std::string>("replace",
-                                            std::function<
-                                            std::tuple<bool, std::string>(std::unordered_map<std::string, std::string>,
-                                                                          std::vector<XmlNode>)>(
-                                            [document](std::unordered_map<std::string, std::string> params,
-                                                       std::vector<XmlNode> new_data) -> std::tuple<bool, std::string>
-                                            {
-                                                bool removed_any = false;
-                                                for(auto it = document->begin(); it != document->end();)
-                                                {
-                                                    if(xml_node_matches(*it, params))
-                                                    {
-                                                        it = document->erase(it);
-                                                        removed_any = true;
-                                                    }
-                                                    else
-                                                    {
-                                                        ++it;
-                                                    }
-                                                }
-                                                if(!removed_any)
-                                                {
-                                                    return {false, "no matching nodes found"};
-                                                }
-                                                document->insert(document->end(), new_data.begin(), new_data.end());
-                                                return {true, ""};
-                                            })));
+    lua.expose_namespace("example_ns", make_replace_entry(document));
 
     XmlNode replacement;
     replacement.name = "Hardware";
@@ -2126,35 +2140,7 @@ TEST_CASE("expose_namespace: example_ns.replace reports failure via ok/error whe
     Lua lua;
     auto document = std::make_shared<std::vector<XmlNode>>();
 
-    lua.expose_namespace("example_ns",
-                         lua_module_func<
-                         bool, std::string>("replace",
-                                            std::function<
-                                            std::tuple<bool, std::string>(std::unordered_map<std::string, std::string>,
-                                                                          std::vector<XmlNode>)>(
-                                            [document](std::unordered_map<std::string, std::string> params,
-                                                       std::vector<XmlNode> new_data) -> std::tuple<bool, std::string>
-                                            {
-                                                bool removed_any = false;
-                                                for(auto it = document->begin(); it != document->end();)
-                                                {
-                                                    if(xml_node_matches(*it, params))
-                                                    {
-                                                        it = document->erase(it);
-                                                        removed_any = true;
-                                                    }
-                                                    else
-                                                    {
-                                                        ++it;
-                                                    }
-                                                }
-                                                if(!removed_any)
-                                                {
-                                                    return {false, "no matching nodes found"};
-                                                }
-                                                document->insert(document->end(), new_data.begin(), new_data.end());
-                                                return {true, ""};
-                                            })));
+    lua.expose_namespace("example_ns", make_replace_entry(document));
 
     lua.run_script("function do_replace(p, d) return example_ns.replace(p, d) end");
     auto [ok, err, success, message] =
@@ -2175,11 +2161,7 @@ TEST_CASE("expose_namespace: example_ns.append adds nodes without touching exist
     existing.name = "Existing";
     *document = {existing};
 
-    lua.expose_namespace("example_ns",
-                         lua_module_func<>("append",
-                                           std::function<void(std::vector<XmlNode>)>(
-                                           [document](std::vector<XmlNode> new_data)
-                                           { document->insert(document->end(), new_data.begin(), new_data.end()); })));
+    lua.expose_namespace("example_ns", make_append_entry(document));
 
     XmlNode added;
     added.name = "Added";
@@ -2198,34 +2180,8 @@ TEST_CASE("expose_namespace: all three entries are reachable as fields of a sing
     Lua lua;
     auto document = std::make_shared<std::vector<XmlNode>>();
 
-    lua.expose_namespace("example_ns",
-                         lua_module_func<std::vector<XmlNode>>("find",
-                                                               std::function<std::vector<XmlNode>(
-                                                               std::unordered_map<std::string, std::string>)>(
-                                                               [document](
-                                                               std::unordered_map<std::string, std::string> params)
-                                                               {
-                                                                   std::vector<XmlNode> result;
-                                                                   for(const auto& n : *document)
-                                                                   {
-                                                                       if(xml_node_matches(n, params))
-                                                                       {
-                                                                           result.push_back(n);
-                                                                       }
-                                                                   }
-                                                                   return result;
-                                                               })),
-                         lua_module_func<
-                         bool, std::string>("replace",
-                                            std::function<
-                                            std::tuple<bool, std::string>(std::unordered_map<std::string, std::string>,
-                                                                          std::vector<XmlNode>)>(
-                                            [](std::unordered_map<std::string, std::string>, std::vector<XmlNode>)
-                                            -> std::tuple<bool, std::string> { return {true, ""}; })),
-                         lua_module_func<>("append",
-                                           std::function<void(std::vector<XmlNode>)>(
-                                           [document](std::vector<XmlNode> new_data)
-                                           { document->insert(document->end(), new_data.begin(), new_data.end()); })));
+    lua.expose_namespace("example_ns", make_find_entry(document), make_replace_entry(document),
+                         make_append_entry(document));
 
     auto [ok, err] = lua.run_script(R"(
 		assert(type(example_ns) == 'table')
