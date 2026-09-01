@@ -461,6 +461,36 @@ auto [ok, err, result] = lua.call<XmlNode>("recolor", node);
 // result.attributes.at("color") == "blue"
 ```
 
+The reverse direction - Lua pulling data from C++ on demand, rather than
+receiving it as a function argument - works the same way via `expose_func`
+with an `XmlNode` return type:
+
+```cpp
+XmlNode doc;
+doc.name = "config";
+doc.attributes = {{"version", "1.0"}};
+
+lua.expose_func<XmlNode>("get_document", std::function<XmlNode()>([doc]() { return doc; }));
+lua.run_script("local d = get_document() assert(d.attributes.version == '1.0')");
+```
+
+Mutation in place - rather than through a returned copy - works via
+`expose_mutable_method`, exactly as with any other registered struct:
+
+```cpp
+lua.expose_mutable_method<XmlNode>("set_attribute",
+    std::function<void(XmlNode&, std::string, std::string)>(
+        [](XmlNode& n, std::string key, std::string value) { n.attributes[key] = value; }));
+
+XmlNode node;
+node.name = "shape";
+node.attributes = {{"color", "red"}};
+lua.assign("shape_node", node);
+
+lua.run_script("shape_node:set_attribute('color', 'blue')");
+lua.run_script("assert(shape_node.attributes.color == 'blue')");
+```
+
 Appending a child, editing a deeply nested grandchild's field, building a
 node from a Lua table literal, and passing/returning a
 `std::vector<XmlNode>` of sibling top-level nodes all work the same way -

@@ -1903,6 +1903,80 @@ TEST_CASE("xml: expose_func can recursively flatten a tree built as a Lua table 
     REQUIRE(names == std::vector<std::string>{"root", "a", "b", "c"});
 }
 
+TEST_CASE("xml: expose_func exposes a C++-built tree that Lua fetches on demand", "[struct][xml][expose_func]")
+{
+    Lua lua;
+
+    XmlNode doc;
+    doc.name = "config";
+    doc.attributes = {{"version", "1.0"}};
+    XmlNode child;
+    child.name = "setting";
+    child.attributes = {{"name", "debug"}, {"value", "true"}};
+    doc.children = {child};
+
+    // Lua doesn't build or receive this tree as an argument - it calls a
+    // C++-exposed getter whenever it wants a copy of the current document.
+    lua.expose_func<XmlNode>("get_document", std::function<XmlNode()>([doc]() { return doc; }));
+
+    lua.run_script(R"(
+		function read_setting()
+			local d = get_document()
+			return d.attributes.version, d.children[1].attributes.value
+		end
+	)");
+
+    auto [ok2, err2, version, value] = lua.call<std::string, std::string>("read_setting");
+    REQUIRE(ok2);
+    REQUIRE(version == "1.0");
+    REQUIRE(value == "true");
+}
+
+TEST_CASE("xml: expose_mutable_method mutates an XmlNode instance's attributes in place from Lua",
+          "[struct][xml][expose_mutable_method]")
+{
+    Lua lua;
+    lua.expose_mutable_method<XmlNode>("set_attribute", std::function<void(XmlNode&, std::string, std::string)>(
+                                                        [](XmlNode& n, std::string key, std::string value)
+                                                        { n.attributes[key] = value; }));
+
+    XmlNode node;
+    node.name = "shape";
+    node.attributes = {{"color", "red"}};
+    lua.assign("shape_node", node);
+
+    auto [ok, err] = lua.run_script(R"(
+		shape_node:set_attribute('color', 'blue')
+		assert(shape_node.attributes.color == 'blue')
+	)");
+    REQUIRE(ok);
+}
+
+TEST_CASE("xml: expose_mutable_method appends a child to an XmlNode instance in place and returns the new count",
+          "[struct][xml][expose_mutable_method]")
+{
+    Lua lua;
+    lua.expose_mutable_method<XmlNode, int>("add_child", std::function<int(XmlNode&, std::string)>(
+                                                         [](XmlNode& n, std::string child_name)
+                                                         {
+                                                             XmlNode child;
+                                                             child.name = child_name;
+                                                             n.children.push_back(child);
+                                                             return static_cast<int>(n.children.size());
+                                                         }));
+
+    XmlNode node;
+    node.name = "parent";
+    lua.assign("parent_node", node);
+
+    auto [ok, err] = lua.run_script(R"(
+		assert(parent_node:add_child('kid') == 1)
+		assert(#parent_node.children == 1)
+		assert(parent_node.children[1].name == 'kid')
+	)");
+    REQUIRE(ok);
+}
+
 // ============================================================
 // assign - remaining supported types
 // ============================================================

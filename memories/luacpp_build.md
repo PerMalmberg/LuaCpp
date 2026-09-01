@@ -40,6 +40,38 @@ the "data-centric subset only" caveat, and a short attribute-mutation
 round-trip code sample, pointing to the `[xml]`-tagged tests for full
 runnable examples.
 
+Follow-up 3: user asked for a similar example using `expose_mutable_method`.
+Added 2 more `[xml]` tests (now 12 total, 39 assertions): "xml:
+expose_mutable_method mutates an XmlNode instance's attributes in place
+from Lua" (`set_attribute(key, value)` writing into `n.attributes[key]` on
+a `lua.assign()`-registered instance, then read back via
+`shape_node.attributes.color`), and "xml: expose_mutable_method appends a
+child to an XmlNode instance in place and returns the new count"
+(`add_child(name)` pushes a new `XmlNode` onto `n.children` and returns
+`n.children.size()` as an `int`, demonstrating the mutation+return-value
+combo). Both operate on a Lua-assigned instance (`p:method(...)` style,
+matching the existing Point mutable-method tests) rather than going
+through `call<XmlNode>`. Added a matching README snippet (right after the
+`expose_func` getter example in the Data-centric XML tree section) showing
+`expose_mutable_method<XmlNode>("set_attribute", ...)`. Verified: full
+rebuild, `[xml]` tests 12/12 (39 assertions), full suite 260/260 (1239
+assertions, up from 258/1237).
+
+Follow-up 2: user asked whether we have an example of "Lua retrieves XML
+data from C++" - distinct from the existing tests, which were all either
+push-style (C++ passes an XmlNode as an argument to a Lua function) or
+round-trip (Lua mutates and returns it). Confirmed the gap (no
+`expose_func<XmlNode>` existed) and, on request, added a 10th `[xml]` test:
+"xml: expose_func exposes a C++-built tree that Lua fetches on demand" -
+`lua.expose_func<XmlNode>("get_document", std::function<XmlNode()>([doc]()
+{ return doc; }))`, then a Lua script calls `get_document()` itself and
+reads nested attributes (`d.attributes.version`,
+`d.children[1].attributes.value`). Also added a matching short README
+snippet (same section, right after the attribute-mutation round-trip
+example) titled "The reverse direction - Lua pulling data from C++ on
+demand". Verified: full rebuild, `[xml]` tests now 10/10 (37 assertions),
+full suite 258/258 (1237 assertions, up from 257/1234).
+
 Follow-up: user asked to use `R"(...)"` raw string literals instead of
 concatenated `"..." "..."` string literals for embedded Lua source, matching
 the pre-existing style used elsewhere in `test.cpp` (e.g. "struct: nested
@@ -109,7 +141,7 @@ owners) - see the memory-tool file for full details of each step.
      possible/needed).
   5) coroutine resumption after C++ teardown - same hazard as item 1,
      reachable via a resumed coroutine instead of a direct call.
-- Full test suite is currently 257/257 passing (1234 assertions).
+- Full test suite is currently 260/260 passing (1239 assertions).
 
 ## Named recurring magic numbers in Lua.hpp
 
